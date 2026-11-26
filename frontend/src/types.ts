@@ -48,13 +48,37 @@ export interface DatasetProfile {
   numeric_summary: NumericMetric[];
   quality: ColumnQuality[];
   categories: Array<{column: string; values: Array<{name: string; count: number}>}>;
-  category_analysis: Array<{column: string; metric: string; values: Array<{name: string; sum: number}>}>;
+  category_analysis: Array<{
+    column: string;
+    metric: string;
+    metric_type?: "revenue" | "sales_amount";
+    values: Array<{name: string; sum: number | null}>;
+  }>;
   correlations: Array<{left: string; right: string; coefficient: number; absolute: number}>;
+  financial_metrics?: Record<string, {
+    status: "available" | "ambiguous" | "unavailable";
+    column: string | null;
+    candidates: string[];
+    total?: number | null;
+    average?: number | null;
+    count?: number | null;
+    valid_count?: number;
+    unit?: string;
+    aggregation?: string;
+    reason?: string;
+  }>;
   duplicate_rows: number;
   kpis: {
     total_revenue: number | null;
     total_profit: number | null;
     average_sales: number | null;
+    total_sales_amount?: number | null;
+    average_sales_amount?: number | null;
+    total_units_sold?: number | null;
+    average_units_sold?: number | null;
+    total_expenses?: number | null;
+    transaction_count?: number | null;
+    average_profit_margin?: number | null;
     growth: {
       metric: string;
       percent: number;
@@ -63,6 +87,13 @@ export interface DatasetProfile {
       previous_value: number;
       current_value: number;
     } | null;
+    growth_status?: {
+      status: "available" | "unavailable";
+      reason: string | null;
+      current_period?: string;
+      required_previous_period?: string;
+      previous_period?: string;
+    };
   };
   preview: Array<Record<string, unknown>>;
 }

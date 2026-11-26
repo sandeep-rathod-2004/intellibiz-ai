@@ -663,6 +663,125 @@ def test_local_copilot_question_types_use_only_computed_profile(monkeypatch, que
     assert expected in result["answer"]
 
 
+def test_local_copilot_reports_ambiguous_sales_without_guessing_currency(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "groq")
+    facts = {"profile": profile(pd.DataFrame({"units": [3, 5], "sales": [3, 5]}))}
+
+    result = asyncio.run(copilot.ask_copilot("What are total sales?", facts))
+
+    # Independent values: units total 8; "sales" is an unqualified field, so
+    # there is no defensible monetary total to return.
+    assert result["provider"] == "local_analytics"
+    assert "sales amount KPI is unavailable" in result["answer"]
+    assert "sales" in result["answer"]
+    assert "8" not in result["answer"]
+
+
+def test_local_copilot_does_not_treat_profit_margin_as_total_profit(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "groq")
+    facts = {"profile": profile(pd.DataFrame({"profit_margin_pct": [10, 20]}))}
+
+    result = asyncio.run(copilot.ask_copilot("What is total profit?", facts))
+
+    # A margin percentage exists, but no profit amount column exists.
+    assert "No unambiguous profit field is available" in result["answer"]
+    assert "30" not in result["answer"]
+
+
+def test_local_copilot_answers_explicit_financial_metric_from_profile(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "groq")
+    facts = {"profile": profile(pd.DataFrame({"revenue": [100, 250]}))}
+
+    result = asyncio.run(copilot.ask_copilot("What is total revenue?", facts))
+
+    # Independent arithmetic: 100 + 250 = 350.
+    assert "computed total revenue from revenue is 350" in result["answer"]
+
+
+@pytest.mark.parametrize(
+    ("question", "frame", "expected"),
+    [
+        ("What is the revenue?", pd.DataFrame({"revenue": [100, 200]}), "computed total revenue from revenue is 300"),
+        ("What was our profit?", pd.DataFrame({"profit": [10, 15]}), "computed total profit from profit is 25"),
+        ("Show me total sales.", pd.DataFrame({"sales_amount": [10, 20]}), "computed total sales amount from sales_amount is 30"),
+        ("What is the average revenue?", pd.DataFrame({"revenue": [100, 200]}), "computed mean revenue from revenue is 150"),
+    ],
+)
+def test_local_copilot_recognizes_common_financial_paraphrases(monkeypatch, question, frame, expected):
+    monkeypatch.setattr(settings, "ai_provider", "groq")
+
+    def reject_provider_call(*args, **kwargs):
+        raise AssertionError("A deterministic financial metric question must not call an AI provider.")
+
+    monkeypatch.setattr(copilot, "_get_openai_client", reject_provider_call)
+    result = asyncio.run(copilot.ask_copilot(question, {"profile": profile(frame)}))
+
+    assert result["provider"] == "local_analytics"
+    assert expected in result["answer"]
+
+
+def test_local_copilot_paraphrase_reports_ambiguous_revenue_without_raw_column_guess(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "groq")
+    facts = {"profile": profile(pd.DataFrame({"revenue": [100, 200], "net_revenue": [90, 180]}))}
+
+    result = asyncio.run(copilot.ask_copilot("What is the revenue?", facts))
+
+    assert "revenue KPI is unavailable because the matching columns are ambiguous" in result["answer"]
+    assert "revenue, net_revenue" in result["answer"]
+    assert "300" not in result["answer"]
+
+
+def test_local_copilot_reports_unavailable_metric_without_using_unrelated_numeric_column(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "groq")
+    facts = {"profile": profile(pd.DataFrame({"score": [99, 101]}))}
+
+    result = asyncio.run(copilot.ask_copilot("What is the revenue?", facts))
+
+    assert "No unambiguous revenue field is available because no recognized field was found" in result["answer"]
+    assert "200" not in result["answer"]
+
+
+def test_local_copilot_explains_financial_aggregation_overflow(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "groq")
+    facts = {"profile": profile(pd.DataFrame({"revenue": [1.7e308, 1.7e308]}))}
+
+    result = asyncio.run(copilot.ask_copilot("What is the revenue?", facts))
+
+    assert "field revenue is recognized" in result["answer"]
+    assert "aggregation exceeded the supported numeric range" in result["answer"]
+    assert "unavailable" in result["answer"]
+
+
+def test_local_copilot_explains_unavailable_monthly_growth(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "groq")
+    facts = {
+        "profile": profile(pd.DataFrame({
+            "date": ["2025-01-01", "2025-03-01"],
+            "revenue": [100, 200],
+        }))
+    }
+
+    result = asyncio.run(copilot.ask_copilot("What is the month-over-month growth?", facts))
+
+    assert "month-over-month growth is unavailable" in result["answer"].lower()
+    assert "immediately preceding calendar month is missing" in result["answer"]
+
+
+def test_local_fallback_uses_financial_semantics_and_hides_ambiguous_raw_columns():
+    available = copilot._local_fallback_answer(
+        {"profile": profile(pd.DataFrame({"revenue": [100, 200]}))},
+        "Provider unavailable.",
+    )
+    ambiguous = copilot._local_fallback_answer(
+        {"profile": profile(pd.DataFrame({"revenue": [100, 200], "net_revenue": [90, 180]}))},
+        "Provider unavailable.",
+    )
+
+    assert "Revenue total: 300 from revenue" in available["answer"]
+    assert "Revenue: unavailable (ambiguous columns: revenue, net_revenue)" in ambiguous["answer"]
+    assert "revenue: mean" not in ambiguous["answer"]
+
+
 @pytest.mark.parametrize("extension", [".csv", ".xlsx"])
 def test_local_record_and_column_counts_support_csv_and_excel(monkeypatch, extension):
     monkeypatch.setattr(settings, "ai_provider", "groq")

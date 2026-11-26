@@ -255,6 +255,21 @@ def _bounded_context(question: str, facts: dict) -> str:
     category_analysis = facts.get("insights")
     if not isinstance(category_analysis, list):
         category_analysis = []
+    financial_metrics = profile.get("financial_metrics")
+    financial_metrics = financial_metrics if isinstance(financial_metrics, dict) else {}
+    financial_semantics = {}
+    for name, item in financial_metrics.items():
+        if not isinstance(name, str) or not isinstance(item, dict):
+            continue
+        financial_semantics[name] = {
+            "status": item.get("status"),
+            "column": item.get("column"),
+            "candidates": item.get("candidates", [])[:5]
+            if isinstance(item.get("candidates"), list) else [],
+            "unit": item.get("unit"),
+            "aggregation": item.get("aggregation"),
+            "reason": item.get("reason"),
+        }
 
     approved_facts = {
         "dataset": str(facts.get("dataset", ""))[:160],
@@ -283,6 +298,7 @@ def _bounded_context(question: str, facts: dict) -> str:
                 )
             ][:3] if isinstance(profile.get("correlations"), list) else [],
             "kpis": profile.get("kpis", {}),
+            "financial_metrics": financial_semantics,
         },
         "insights": category_analysis[:3],
     }
@@ -654,6 +670,73 @@ def _local_analytics_answer(question: str, facts: dict) -> str | None:
     def local(answer: str) -> str:
         return f"Local computed analysis (not AI-generated):\n\n{answer}"
 
+    asks_trend = has_any("growth", "trend", "changed", "increased", "decreased", "change over time")
+    asks_growth_value = has_any(
+        "growth", "trend", "change over time", "month over month",
+        "month-over-month", "growth rate", "percentage change", "percent change",
+    )
+    financial_question: tuple[str, str, str] | None = None
+    asks_extrema = (
+        has_any("minimum", "maximum", "min value", "max value", "smallest", "largest", "median", "standard deviation")
+        or has_word("min", "max", "median", "std")
+    )
+    if not asks_trend and not asks_extrema and not has_any("compare", "versus", "vs"):
+        if has_any("profit margin", "margin percentage", "margin percent"):
+            financial_question = ("profit_margin", "profit margin", "average_profit_margin")
+        elif has_any("units sold", "quantity sold", "how many units", "how many items"):
+            financial_question = ("units_sold", "units sold", "total_units_sold")
+        elif has_any("transaction count", "number of transactions", "transactions", "orders") or (
+            has_any("how many", "count", "number of") and has_word("sales", "sale")
+        ):
+            financial_question = ("transaction_count", "transactions", "transaction_count")
+        elif has_any("total revenue", "revenue total", "revenue amount", "how much revenue", "total turnover") or has_word("revenue", "turnover"):
+            financial_question = ("revenue", "revenue", "total_revenue")
+        elif has_any("sales amount", "sales value", "total sales", "sales revenue", "how much sales", "average sales", "mean sales", "show me sales"):
+            financial_question = ("sales_amount", "sales amount", "total_sales_amount")
+        elif has_any("total profit", "profit total", "profit amount", "how much profit", "total earnings") or has_word("profit"):
+            financial_question = ("profit", "profit", "total_profit")
+        elif has_any("total expenses", "total expense", "expense total", "expense amount", "how much expense") or has_word("expenses", "expense"):
+            financial_question = ("expenses", "expenses", "total_expenses")
+
+    if financial_question and isinstance(profile.get("financial_metrics"), dict):
+        metric_name, label, kpi_name = financial_question
+        metric_data = profile.get("financial_metrics")
+        metric_data = metric_data.get(metric_name) if isinstance(metric_data, dict) else None
+        if not isinstance(metric_data, dict):
+            return local(f"The {label} business metric is unavailable because its semantics were not established.")
+        status = metric_data.get("status")
+        if status == "ambiguous":
+            candidates = metric_data.get("candidates", [])
+            candidate_text = ", ".join(str(item) for item in candidates) if isinstance(candidates, list) else ""
+            return local(f"The {label} KPI is unavailable because the matching columns are ambiguous: {candidate_text}.")
+        if status != "available":
+            reason = metric_data.get("reason")
+            source = metric_data.get("column")
+            if reason == "aggregation_overflow":
+                return local(f"The {label} field {source} is recognized, but its aggregation exceeded the supported numeric range; the metric is unavailable.")
+            if reason == "no_valid_numeric_values":
+                return local(f"The {label} field {source} has no valid finite numeric values; the metric is unavailable.")
+            if reason == "no_recognized_column":
+                return local(f"No unambiguous {label} field is available because no recognized field was found.")
+            return local(f"The {label} metric is unavailable because its source values could not be calculated safely.")
+        average_requested = has_any("average", "mean") or metric_name == "profit_margin"
+        if average_requested and metric_name != "transaction_count":
+            value = metric_data.get("average")
+        else:
+            value = profile.get("kpis", {}).get(kpi_name) if isinstance(profile.get("kpis"), dict) else None
+        if value is None:
+            return local(f"The {label} metric has no valid numeric values.")
+        formatted = _format_local_number(value)
+        if formatted is None:
+            return local(f"The {label} metric is unavailable because its value is not finite.")
+        source = metric_data.get("column")
+        if metric_name == "profit_margin":
+            unit = metric_data.get("unit")
+            suffix = "%" if unit == "percent" else " source units"
+            return local(f"The unweighted mean profit margin from {source} is {formatted}{suffix}; this is not a revenue-weighted margin.")
+        value_kind = "mean" if average_requested else "count" if metric_name == "transaction_count" else "total"
+        return local(f"The computed {value_kind} {label} from {source} is {formatted}.")
+
     rows = count_value(profile.get("rows"))
     columns = count_value(profile.get("columns"))
     if columns is None and column_names:
@@ -842,7 +925,7 @@ def _local_analytics_answer(question: str, facts: dict) -> str | None:
             return local("; ".join(lines) + ".")
         return local("Numeric summaries: " + "; ".join(lines) + ".")
 
-    if has_any("trend", "growth", "increased", "decreased", "change over time"):
+    if asks_growth_value:
         kpis = profile.get("kpis")
         growth = kpis.get("growth") if isinstance(kpis, dict) else None
         if isinstance(growth, dict):
@@ -855,6 +938,20 @@ def _local_analytics_answer(question: str, facts: dict) -> str | None:
                     f"{growth.get('previous_period')} ({previous}) to "
                     f"{growth.get('current_period')} ({current})."
                 )
+        status = kpis.get("growth_status") if isinstance(kpis, dict) else None
+        reason = status.get("reason") if isinstance(status, dict) else None
+        unavailable_reasons = {
+            "missing_previous_month": "the immediately preceding calendar month is missing",
+            "zero_previous_value": "the previous month has zero value",
+            "negative_previous_value": "the previous month has negative value",
+            "monthly_aggregation_overflow": "monthly aggregation could not be calculated safely",
+            "growth_calculation_overflow": "the growth calculation exceeded the supported numeric range",
+            "insufficient_months": "there are not enough monthly observations",
+            "no_valid_dated_values": "there are no valid dated financial values",
+            "date_or_financial_metric_unavailable": "a recognized date or financial metric is unavailable",
+        }
+        explanation = unavailable_reasons.get(reason, "a valid consecutive-month comparison is unavailable")
+        return local(f"Month-over-month growth is unavailable because {explanation}.")
 
     if has_any("summarize", "summary", "describe", "overview"):
         pieces = []
@@ -900,10 +997,61 @@ def _local_fallback_answer(facts: dict, reason: str) -> dict[str, str]:
         )
         summary.append(f"Missing values: {_format_local_number(missing)}")
 
+    financial = profile.get("financial_metrics")
+    financial = financial if isinstance(financial, dict) else {}
+    kpis = profile.get("kpis") if isinstance(profile.get("kpis"), dict) else {}
+    financial_columns = {
+        str(column)
+        for item in financial.values()
+        if isinstance(item, dict)
+        for column in item.get("candidates", [])
+    }
+    financial_fallback_fields = {
+        "revenue": ("Revenue total", "total_revenue", "total"),
+        "sales_amount": ("Sales amount total", "total_sales_amount", "total"),
+        "profit": ("Profit total", "total_profit", "total"),
+        "expenses": ("Expenses total", "total_expenses", "total"),
+        "units_sold": ("Units sold total", "total_units_sold", "total"),
+        "transaction_count": ("Transaction count", "transaction_count", "count"),
+        "profit_margin": ("Unweighted mean profit margin", "average_profit_margin", "average"),
+    }
+    for metric_name, (label, kpi_name, field) in financial_fallback_fields.items():
+        item = financial.get(metric_name)
+        if not isinstance(item, dict):
+            continue
+        status = item.get("status")
+        source = item.get("column")
+        if status == "available":
+            value = item.get(field) if field == "average" else kpis.get(kpi_name)
+            formatted = _format_local_number(value)
+            if formatted is not None:
+                unit = (
+                    "%" if item.get("unit") == "percent" else " source units (unspecified)"
+                ) if metric_name == "profit_margin" else ""
+                source_text = f" from {source}" if source else ""
+                summary.append(f"{label}: {formatted}{unit}{source_text}")
+            if metric_name in {"sales_amount", "units_sold"}:
+                average = _format_local_number(item.get("average"))
+                if average is not None:
+                    average_label = "Sales amount average" if metric_name == "sales_amount" else "Units sold average"
+                    summary.append(f"{average_label}: {average}" + (f" from {source}" if source else ""))
+        elif status == "ambiguous":
+            candidates = item.get("candidates", [])
+            summary.append(f"{label.removesuffix(' total')}: unavailable (ambiguous columns: {', '.join(map(str, candidates))})")
+        elif source:
+            if item.get("reason") == "aggregation_overflow":
+                summary.append(f"{label}: unavailable (aggregation overflow in {source})")
+            elif item.get("reason") == "no_valid_numeric_values":
+                summary.append(f"{label}: unavailable (no valid finite values in {source})")
+            elif item.get("reason") == "no_valid_identifiers":
+                summary.append(f"{label}: unavailable (no valid identifiers in {source})")
+
     numeric = profile.get("numeric_summary")
     if isinstance(numeric, list):
         for metric in numeric:
             if not isinstance(metric, dict) or not isinstance(metric.get("name"), str):
+                continue
+            if metric["name"] in financial_columns:
                 continue
             values = [
                 f"{label} {_format_local_number(metric.get(field))}"

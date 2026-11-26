@@ -714,6 +714,47 @@ def test_anomaly_sensitivity_and_report_use_owned_dataset(auth_client, tmp_path,
     assert b"anomaly_score,explanation" in report.content
 
 
+def test_analysis_and_pdf_routes_handle_overflowing_unrelated_numeric_summary(
+    auth_client, tmp_path, monkeypatch
+):
+    client, test_session = auth_client
+    registration = register(client, "overflow-analysis@example.com")
+    token = login(client, "overflow-analysis@example.com").json()["access_token"]
+    user_id = registration.json()["user"]["id"]
+    monkeypatch.setattr(api_routes, "DATA_DIR", tmp_path)
+    source = tmp_path / "overflow.csv"
+    source.write_text("score\n1.7e308\n1.7e308\n", encoding="utf-8")
+    with test_session() as db:
+        dataset = Dataset(
+            owner_id=user_id,
+            name="overflow.csv",
+            stored_name=source.name,
+            row_count=2,
+            column_count=1,
+            file_size=source.stat().st_size,
+        )
+        db.add(dataset)
+        db.commit()
+        dataset_id = dataset.id
+
+    headers = {"Authorization": f"Bearer {token}"}
+    analysis = client.get(f"/api/v1/datasets/{dataset_id}/analysis", headers=headers)
+    report = client.get(f"/api/v1/datasets/{dataset_id}/report", headers=headers)
+
+    assert analysis.status_code == 200
+    payload = json.loads(
+        analysis.content,
+        parse_constant=lambda token: pytest.fail(f"Non-finite JSON constant leaked: {token}"),
+    )
+    score = next(item for item in payload["profile"]["numeric_summary"] if item["name"] == "score")
+    assert score["sum"] is None
+    assert score["mean"] is None
+    assert any(item.get("title") == "score: summary unavailable" for item in payload["insights"])
+    assert report.status_code == 200
+    assert report.headers["content-type"].startswith("application/pdf")
+    assert report.content.startswith(b"%PDF-")
+
+
 def test_public_sample_download_is_available():
     response = TestClient(app).get("/api/v1/samples/retail-sales")
 

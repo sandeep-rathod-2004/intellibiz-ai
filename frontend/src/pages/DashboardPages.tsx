@@ -117,11 +117,60 @@ export function OverviewPage() {
     const missing = analysis.profile.quality.reduce((sum, item) => sum + item.missing, 0);
     return Math.max(0, 100 - missing / (analysis.profile.rows * analysis.profile.columns) * 100);
   }, [analysis]);
-  const chartData = metrics.slice(0, 6).map(metric => ({
+  const chartData = metrics
+    .filter(metric => metric[chartMetric] !== null && metric[chartMetric] !== undefined)
+    .slice(0, 6)
+    .map(metric => ({
     name: metric.name.length > 16 ? `${metric.name.slice(0, 15)}…` : metric.name,
-    sum: metric.sum ?? 0,
-    mean: metric.mean ?? 0,
+    value: metric[chartMetric] as number,
   }));
+  const financial = analysis?.profile.financial_metrics;
+  const averageSalesAmount = analysis?.profile.kpis.average_sales_amount ?? analysis?.profile.kpis.average_sales;
+  const metricNote = (name: string, fallback: string) => {
+    const metric = financial?.[name];
+    if (metric?.status === "ambiguous") {
+      return `Ambiguous columns: ${metric.candidates.join(", ")}. No value calculated.`;
+    }
+    if (metric?.status === "available" && metric.column) return `From ${metric.column}`;
+    if (metric?.reason === "aggregation_overflow") {
+      return metric.column
+        ? `Recognized field ${metric.column}; aggregation exceeded the supported numeric range`
+        : "Aggregation exceeded the supported numeric range";
+    }
+    if (metric?.reason === "no_valid_numeric_values" && metric.column) {
+      return `No valid numeric values in ${metric.column}`;
+    }
+    if (metric?.reason === "no_recognized_transaction_identifier") {
+      return "No recognized transaction or order ID field identified";
+    }
+    if (metric?.reason === "multiple_transaction_identifier_columns") {
+      return `Ambiguous transaction ID columns: ${metric.candidates.join(", ")}`;
+    }
+    if (metric?.reason === "no_valid_identifiers") {
+      return `Recognized transaction ID field ${metric.column}; no valid identifiers were found`;
+    }
+    return fallback;
+  };
+  const growthStatus = analysis?.profile.kpis.growth_status;
+  const growthNote = analysis?.profile.kpis.growth
+    ? `${analysis.profile.kpis.growth.previous_period} → ${analysis.profile.kpis.growth.current_period}`
+    : growthStatus?.reason === "missing_previous_month"
+      ? `Missing ${growthStatus.required_previous_period}; month-over-month growth unavailable`
+      : growthStatus?.reason === "zero_previous_value"
+        ? "Previous month is zero; growth rate unavailable"
+        : growthStatus?.reason === "negative_previous_value"
+          ? "Previous month is negative; growth rate unavailable"
+        : growthStatus?.reason === "monthly_aggregation_overflow"
+          ? "Monthly aggregation could not be calculated safely"
+          : growthStatus?.reason === "growth_calculation_overflow"
+            ? "Growth calculation exceeded the supported numeric range"
+            : growthStatus?.reason === "insufficient_months"
+              ? "At least two consecutive months of recognized financial data are required"
+              : growthStatus?.reason === "no_valid_dated_values"
+                ? "No valid dated financial values are available for comparison"
+              : growthStatus?.reason === "date_or_financial_metric_unavailable"
+                ? "A recognized date and financial field are required to calculate growth"
+                : "Requires recognized financial data in consecutive months";
   const forecastReady = Boolean(
     analysis?.profile.column_names.some(column => /date|time/i.test(column)) && metrics.length,
   );
@@ -157,27 +206,69 @@ export function OverviewPage() {
           icon={<DollarSign />}
           label="Total revenue"
           value={analysis?.profile.kpis.total_revenue == null ? "—" : numberFormat.format(analysis.profile.kpis.total_revenue)}
-          note={analysis?.profile.kpis.total_revenue == null ? "No revenue field identified" : "Computed from uploaded records"}
+          note={metricNote("revenue", "No unambiguous revenue field identified")}
           tone="blue"
         />
         <MetricCard
           icon={<DollarSign />}
           label="Total profit"
           value={analysis?.profile.kpis.total_profit == null ? "—" : numberFormat.format(analysis.profile.kpis.total_profit)}
-          note={analysis?.profile.kpis.total_profit == null ? "No profit field identified" : "Computed from uploaded records"}
+          note={metricNote("profit", "No unambiguous profit amount field identified")}
           tone="violet"
         />
         <MetricCard
           icon={<Activity />}
-          label="Average sales"
-          value={analysis?.profile.kpis.average_sales == null ? "—" : numberFormat.format(analysis.profile.kpis.average_sales)}
-          note={analysis?.profile.kpis.average_sales == null ? "No sales field identified" : "Mean of valid sales values"}
+          label="Average sales amount"
+          value={averageSalesAmount == null ? "—" : numberFormat.format(averageSalesAmount)}
+          note={metricNote("sales_amount", "Ambiguous sales fields are not treated as money")}
+        />
+        <MetricCard
+          icon={<DollarSign />}
+          label="Total sales amount"
+          value={analysis?.profile.kpis.total_sales_amount == null ? "—" : numberFormat.format(analysis.profile.kpis.total_sales_amount)}
+          note={metricNote("sales_amount", "Use a clearly named sales amount or value field")}
+          tone="blue"
+        />
+        <MetricCard
+          icon={<DollarSign />}
+          label="Total expenses"
+          value={analysis?.profile.kpis.total_expenses == null ? "—" : numberFormat.format(analysis.profile.kpis.total_expenses)}
+          note={metricNote("expenses", "No unambiguous expense amount field identified")}
+          tone="violet"
+        />
+        <MetricCard
+          icon={<Activity />}
+          label="Units sold"
+          value={analysis?.profile.kpis.total_units_sold == null ? "—" : numberFormat.format(analysis.profile.kpis.total_units_sold)}
+          note={metricNote("units_sold", "No unambiguous quantity field identified")}
+        />
+        <MetricCard
+          icon={<Activity />}
+          label="Average units per record"
+          value={analysis?.profile.kpis.average_units_sold == null ? "—" : numberFormat.format(analysis.profile.kpis.average_units_sold)}
+          note={metricNote("units_sold", "No unambiguous quantity field identified")}
+        />
+        <MetricCard
+          icon={<Database />}
+          label="Transactions"
+          value={analysis?.profile.kpis.transaction_count == null ? "—" : numberFormat.format(analysis.profile.kpis.transaction_count)}
+          note={metricNote("transaction_count", "Requires a recognized transaction or order ID")}
+        />
+        <MetricCard
+          icon={<Activity />}
+          label="Unweighted mean profit margin"
+          value={analysis?.profile.kpis.average_profit_margin == null ? "—" : `${numberFormat.format(analysis.profile.kpis.average_profit_margin)}${financial?.profit_margin?.unit === "percent" ? "%" : ""}`}
+          note={financial?.profit_margin?.status === "available"
+            ? financial.profit_margin.unit === "percent"
+              ? `Unweighted mean of ${financial.profit_margin.column}; not a revenue-weighted margin`
+              : `Mean of ${financial.profit_margin.column} in source units; not revenue-weighted`
+            : metricNote("profit_margin", "No recognized margin field; margins are never summed as profit")}
         />
         <MetricCard
           icon={<TrendingUp />}
           label="Monthly growth"
           value={analysis?.profile.kpis.growth ? `${analysis.profile.kpis.growth.percent > 0 ? "+" : ""}${numberFormat.format(analysis.profile.kpis.growth.percent)}%` : "—"}
-          note={analysis?.profile.kpis.growth ? `${analysis.profile.kpis.growth.previous_period} → ${analysis.profile.kpis.growth.current_period}` : "Requires comparable monthly periods"}
+          note={growthNote}
           tone="amber"
         />
         <MetricCard icon={<Activity />} label="Numeric indicators" value={String(metrics.length)} note="Measures profiled" tone="blue" />
@@ -188,12 +279,12 @@ export function OverviewPage() {
       <div className="section-grid">
         <section className="panel chart-panel">
           <div className="panel-head">
-            <div><span className="eyebrow">PERFORMANCE INTELLIGENCE</span><h3>Metric overview</h3></div>
+            <div><span className="eyebrow">PERFORMANCE INTELLIGENCE</span><h3>Numeric column statistics</h3><small className="subtle">Columns may use different units; compare them with care.</small></div>
             <label className="chart-control">
-              <span className="sr-only">Chart metric</span>
+              <span className="sr-only">Numeric column statistic</span>
               <select value={chartMetric} onChange={event => setChartMetric(event.target.value as "sum" | "mean")}>
-                <option value="sum">Aggregate</option>
-                <option value="mean">Average</option>
+                <option value="sum">Column sum</option>
+                <option value="mean">Column mean</option>
               </select>
             </label>
           </div>
@@ -205,11 +296,11 @@ export function OverviewPage() {
                 <XAxis dataKey="name" tick={{fill: "var(--muted)", fontSize: 10}} axisLine={false} tickLine={false} />
                 <YAxis tick={{fill: "var(--muted)", fontSize: 10}} axisLine={false} tickLine={false} tickFormatter={value => compactFormat.format(Number(value))} />
                 <Tooltip formatter={value => numberFormat.format(Number(value))} contentStyle={{background: "var(--tooltip)", border: "1px solid var(--border)", borderRadius: 12, color: "var(--text)"}} />
-                <Bar dataKey={chartMetric} name={chartMetric === "sum" ? "Aggregate" : "Average"} fill="url(#barMint)" radius={[7, 7, 2, 2]} />
+                <Bar dataKey="value" name={chartMetric === "sum" ? "Column sum" : "Column mean"} fill="url(#barMint)" radius={[7, 7, 2, 2]} />
               </BarChart>
             </ResponsiveContainer>
-          ) : <div className="chart-empty">No numeric fields are available for charting.</div>}
-          <div className="chart-legend"><span><i className="legend-dot mint-dot" /> Computed values</span><span className="muted">From uploaded records</span></div>
+          ) : <div className="chart-empty">{metrics.length ? `No column ${chartMetric} values are available; unavailable values are not shown as zero.` : "No numeric fields are available for charting."}</div>}
+          <div className="chart-legend"><span><i className="legend-dot mint-dot" /> Raw numeric-column statistics</span><span className="muted">Not normalized business KPIs</span></div>
         </section>
 
         <section className="panel insight-panel">
