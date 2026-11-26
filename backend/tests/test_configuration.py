@@ -81,19 +81,191 @@ def _production_settings(**overrides):
     values = {
         "environment": "production",
         "secret_key": "production-secret-" + ("x" * 40),
+        "database_url": (
+            "postgresql+psycopg://test-user:test-password@localhost:5432/intellibiz_test"
+        ),
         "auto_create_schema": False,
         "data_storage_backend": "supabase",
+        "supabase_storage_driver": "rest",
         "supabase_url": "https://project.supabase.co",
+        "supabase_storage_bucket": "intellibiz-datasets",
         "supabase_service_role_key": "test-service-role-key",
+        "supabase_s3_access_key_id": "test-access-key",
+        "supabase_s3_secret_access_key": "test-s3-secret",
         "cors_origins": "https://app.example.com",
     }
     values.update(overrides)
-    return Settings(**values)
+    return Settings(_env_file=None, **values)
+
+
+def test_storage_defaults_keep_local_backend_and_recommend_rest_driver(monkeypatch):
+    monkeypatch.delenv("DATA_STORAGE_BACKEND", raising=False)
+    monkeypatch.delenv("SUPABASE_STORAGE_DRIVER", raising=False)
+
+    config = Settings(_env_file=None)
+
+    assert config.data_storage_backend == "local"
+    assert config.supabase_storage_driver == "rest"
+
+
+@pytest.mark.parametrize(
+    "database_url",
+    ["sqlite:///./intellibiz.db", "sqlite:///:memory:"],
+)
+def test_production_settings_reject_sqlite_database_urls(database_url):
+    with pytest.raises(ValueError, match="valid PostgreSQL URL"):
+        _production_settings(database_url=database_url)
+
+
+@pytest.mark.parametrize(
+    ("database_url", "expected_url"),
+    [
+        (
+            "postgresql://test-user:test-password@localhost:5432/intellibiz_test",
+            "postgresql+psycopg://test-user:test-password@localhost:5432/intellibiz_test",
+        ),
+        (
+            "postgresql+psycopg://test-user:test-password@localhost:5432/intellibiz_test",
+            "postgresql+psycopg://test-user:test-password@localhost:5432/intellibiz_test",
+        ),
+    ],
+)
+def test_production_settings_accept_postgresql_database_urls(database_url, expected_url):
+    config = _production_settings(database_url=database_url)
+
+    assert config.database_url == expected_url
+
+
+@pytest.mark.parametrize("database_url", ["", "not-a-url", "mysql://db.example/test"])
+def test_production_settings_reject_invalid_database_urls(database_url):
+    with pytest.raises(ValueError, match="valid PostgreSQL URL"):
+        _production_settings(database_url=database_url)
+
+
+def test_development_settings_can_use_sqlite():
+    config = Settings(
+        _env_file=None,
+        environment="development",
+        database_url="sqlite:///:memory:",
+    )
+
+    assert config.database_url == "sqlite:///:memory:"
+
+
+def test_supabase_configuration_requires_url():
+    with pytest.raises(ValueError, match="SUPABASE_URL"):
+        _production_settings(supabase_url="")
+
+
+def test_supabase_configuration_requires_bucket():
+    with pytest.raises(ValueError, match="SUPABASE_STORAGE_BUCKET"):
+        _production_settings(supabase_storage_bucket="")
+
+
+def test_supabase_configuration_requires_a_server_side_key():
+    with pytest.raises(ValueError, match="SUPABASE_SECRET_KEY or SUPABASE_SERVICE_ROLE_KEY"):
+        _production_settings(
+            supabase_secret_key="",
+            supabase_service_role_key="",
+        )
+
+
+def test_supabase_configuration_accepts_new_secret_key():
+    config = _production_settings(
+        supabase_secret_key="sb_secret_test-key",
+        supabase_service_role_key="",
+    )
+
+    assert config.supabase_secret_key == "sb_secret_test-key"
+
+
+@pytest.mark.parametrize(
+    ("field", "message"),
+    [
+        ("supabase_s3_access_key_id", "SUPABASE_S3_ACCESS_KEY_ID"),
+        ("supabase_s3_secret_access_key", "SUPABASE_S3_SECRET_ACCESS_KEY"),
+    ],
+)
+def test_supabase_s3_configuration_requires_distinct_s3_credentials(field, message):
+    with pytest.raises(ValueError, match=message):
+        _production_settings(supabase_storage_driver="s3", **{field: ""})
+
+
+def test_supabase_s3_configuration_uses_project_endpoint_and_region_defaults():
+    config = _production_settings(
+        environment="development",
+        supabase_storage_driver="s3",
+    )
+
+    assert config.supabase_s3_endpoint_url == (
+        "https://rxoxymrcccaqxbmqfazp.storage.supabase.co/storage/v1/s3"
+    )
+    assert config.supabase_s3_region == "ap-south-1"
+
+
+def test_supabase_s3_configuration_loads_the_named_environment_variables(
+    monkeypatch,
+):
+    env_values = {
+        "DATA_STORAGE_BACKEND": "supabase",
+        "SUPABASE_STORAGE_DRIVER": "s3",
+        "ENVIRONMENT": "development",
+        "SECRET_KEY": "dev-only-change-this-secret-before-deploying",
+        "AUTO_CREATE_SCHEMA": "true",
+        "SUPABASE_URL": "https://project.supabase.co",
+        "SUPABASE_STORAGE_BUCKET": "private-datasets",
+        "SUPABASE_SECRET_KEY": "",
+        "SUPABASE_SERVICE_ROLE_KEY": "test-service-role-key",
+        "SUPABASE_S3_ENDPOINT_URL": (
+            "https://rxoxymrcccaqxbmqfazp.storage.supabase.co/storage/v1/s3"
+        ),
+        "SUPABASE_S3_REGION": "ap-south-1",
+        "SUPABASE_S3_ACCESS_KEY_ID": "test-access-key",
+        "SUPABASE_S3_SECRET_ACCESS_KEY": "test-s3-secret",
+    }
+    for key, value in env_values.items():
+        monkeypatch.setenv(key, value)
+
+    config = Settings(_env_file=None)
+
+    assert config.supabase_storage_driver == "s3"
+    assert config.supabase_s3_endpoint_url == env_values["SUPABASE_S3_ENDPOINT_URL"]
+    assert config.supabase_s3_region == "ap-south-1"
+    assert config.supabase_s3_access_key_id == "test-access-key"
+    assert config.supabase_s3_secret_access_key == "test-s3-secret"
+
+
+def test_supabase_s3_configuration_rejects_non_https_endpoint():
+    with pytest.raises(ValueError, match="HTTPS endpoint URL"):
+        _production_settings(
+            supabase_storage_driver="s3",
+            supabase_s3_endpoint_url="http://example.test/s3",
+        )
+
+
+def test_rest_storage_driver_remains_available_without_s3_credentials():
+    config = _production_settings(
+        supabase_storage_driver="rest",
+        supabase_s3_access_key_id="",
+        supabase_s3_secret_access_key="",
+    )
+
+    assert config.supabase_storage_driver == "rest"
+
+
+def test_supabase_configuration_rejects_malformed_new_secret_key():
+    with pytest.raises(ValueError, match="sb_secret_ format"):
+        _production_settings(supabase_secret_key="not-a-supabase-secret-key")
 
 
 def test_production_settings_require_persistent_storage():
     with pytest.raises(ValueError, match="persistent object storage"):
         _production_settings(data_storage_backend="local")
+
+
+def test_production_settings_require_rest_storage_driver():
+    with pytest.raises(ValueError, match="SUPABASE_STORAGE_DRIVER=rest"):
+        _production_settings(supabase_storage_driver="s3")
 
 
 @pytest.mark.parametrize(
@@ -115,3 +287,24 @@ def test_production_settings_accept_private_storage_and_exact_https_origin():
 
     assert config.data_storage_backend == "supabase"
     assert config.cors_origins == "https://app.example.com"
+
+
+@pytest.mark.parametrize(
+    "supabase_url",
+    [
+        "http://project.supabase.co",
+        "not-a-url",
+        "https://",
+        "https://user:password@project.supabase.co",
+        "https://project.supabase.co?token=test",
+    ],
+)
+def test_production_settings_reject_invalid_supabase_urls(supabase_url):
+    with pytest.raises(ValueError, match="valid HTTPS URL"):
+        _production_settings(supabase_url=supabase_url)
+
+
+def test_production_settings_accept_valid_supabase_url():
+    config = _production_settings(supabase_url="https://project.supabase.co")
+
+    assert config.supabase_url == "https://project.supabase.co"

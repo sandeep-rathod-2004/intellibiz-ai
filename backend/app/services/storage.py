@@ -3,7 +3,10 @@ from pathlib import Path
 from typing import NoReturn
 from urllib.parse import quote
 
+import boto3
 import httpx
+from botocore.config import Config
+from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import settings
 
@@ -24,13 +27,99 @@ def _object_url(stored_name: str) -> str:
 
 
 def _headers(content_type: str | None = None) -> dict[str, str]:
-    headers = {
-        "apikey": settings.supabase_service_role_key,
-        "Authorization": f"Bearer {settings.supabase_service_role_key}",
-    }
+    secret_key = settings.supabase_secret_key.strip()
+    if secret_key:
+        headers = {"apikey": secret_key}
+    else:
+        service_role_key = settings.supabase_service_role_key.strip()
+        headers = {
+            "apikey": service_role_key,
+            "Authorization": f"Bearer {service_role_key}",
+        }
     if content_type:
         headers["Content-Type"] = content_type
     return headers
+
+
+def _s3_client():
+    return boto3.client(
+        "s3",
+        endpoint_url=settings.supabase_s3_endpoint_url,
+        region_name=settings.supabase_s3_region,
+        aws_access_key_id=settings.supabase_s3_access_key_id,
+        aws_secret_access_key=settings.supabase_s3_secret_access_key,
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def _is_missing_object(error: ClientError) -> bool:
+    error_code = error.response.get("Error", {}).get("Code")
+    return error_code in {"404", "NoSuchKey", "NotFound"}
+
+
+def _raise_s3_error(operation: str, error: BotoCoreError | ClientError) -> NoReturn:
+    status_code = None
+    if isinstance(error, ClientError):
+        status_code = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    logger.warning(
+        "Dataset storage request failed backend=supabase_s3 operation=%s exception=%s http_status=%s",
+        operation,
+        type(error).__name__,
+        status_code,
+    )
+    raise DatasetStorageError(
+        "Cloud dataset storage is unavailable or misconfigured."
+    ) from error
+
+
+def _save_dataset_rest(stored_name: str, content: bytes) -> None:
+    try:
+        with httpx.Client(timeout=30) as client:
+            response = client.post(
+                _object_url(stored_name),
+                content=content,
+                headers={
+                    **_headers("application/octet-stream"),
+                    "x-upsert": "false",
+                },
+            )
+            response.raise_for_status()
+    except httpx.HTTPError as error:
+        _raise_cloud_error("upload", error)
+
+
+def _read_dataset_rest(stored_name: str) -> bytes:
+    try:
+        with httpx.Client(timeout=30) as client:
+            response = client.get(_object_url(stored_name), headers=_headers())
+            if response.status_code == 404:
+                raise FileNotFoundError(stored_name)
+            response.raise_for_status()
+            return response.content
+    except httpx.HTTPStatusError as error:
+        _raise_cloud_error("download", error)
+    except httpx.HTTPError as error:
+        _raise_cloud_error("download", error)
+
+
+def _delete_dataset_rest(stored_name: str) -> None:
+    bucket_url = (
+        f"{settings.supabase_url.rstrip('/')}/storage/v1/object/"
+        f"{quote(settings.supabase_storage_bucket, safe='')}"
+    )
+    try:
+        with httpx.Client(timeout=30) as client:
+            response = client.request(
+                "DELETE",
+                bucket_url,
+                json={"prefixes": [stored_name]},
+                headers=_headers(),
+            )
+            if response.status_code == 404:
+                return
+            response.raise_for_status()
+    except httpx.HTTPError as error:
+        _raise_cloud_error("delete", error)
 
 
 def storage_readiness() -> dict[str, str | bool]:
@@ -116,36 +205,78 @@ def save_dataset(stored_name: str, content: bytes, local_path: Path) -> None:
         local_path.write_bytes(content)
         return
 
+    if settings.supabase_storage_driver == "rest":
+        _save_dataset_rest(stored_name, content)
+        return
+
     try:
-        with httpx.Client(timeout=30) as client:
-            response = client.post(
-                _object_url(stored_name),
-                content=content,
-                headers={
-                    **_headers("application/octet-stream"),
-                    "x-upsert": "false",
-                },
-            )
-            response.raise_for_status()
-    except httpx.HTTPError as error:
-        _raise_cloud_error("upload", error)
+        _s3_client().put_object(
+            Bucket=settings.supabase_storage_bucket,
+            Key=stored_name,
+            Body=content,
+            ContentType="application/octet-stream",
+        )
+    except (BotoCoreError, ClientError) as error:
+        _raise_s3_error("upload", error)
 
 
 def read_dataset(stored_name: str, local_path: Path) -> bytes:
     if settings.data_storage_backend == "local":
         return local_path.read_bytes()
 
+    if settings.supabase_storage_driver == "rest":
+        return _read_dataset_rest(stored_name)
+
     try:
-        with httpx.Client(timeout=30) as client:
-            response = client.get(_object_url(stored_name), headers=_headers())
-            if response.status_code == 404:
-                raise FileNotFoundError(stored_name)
-            response.raise_for_status()
-            return response.content
-    except httpx.HTTPStatusError as error:
-        _raise_cloud_error("download", error)
-    except httpx.HTTPError as error:
-        _raise_cloud_error("download", error)
+        result = _s3_client().get_object(
+            Bucket=settings.supabase_storage_bucket,
+            Key=stored_name,
+        )
+        body = result["Body"]
+        try:
+            return body.read()
+        finally:
+            body.close()
+    except ClientError as error:
+        if _is_missing_object(error):
+            raise FileNotFoundError(stored_name) from error
+        _raise_s3_error("download", error)
+    except BotoCoreError as error:
+        _raise_s3_error("download", error)
+
+
+def dataset_exists(stored_name: str, local_path: Path) -> bool:
+    if settings.data_storage_backend == "local":
+        return local_path.is_file()
+
+    if settings.supabase_storage_driver == "rest":
+        try:
+            with httpx.Client(timeout=30) as client:
+                response = client.head(
+                    _object_url(stored_name),
+                    headers=_headers(),
+                )
+                if response.status_code == 404:
+                    return False
+                response.raise_for_status()
+                return True
+        except httpx.HTTPStatusError as error:
+            _raise_cloud_error("exists", error)
+        except httpx.HTTPError as error:
+            _raise_cloud_error("exists", error)
+
+    try:
+        _s3_client().head_object(
+            Bucket=settings.supabase_storage_bucket,
+            Key=stored_name,
+        )
+        return True
+    except ClientError as error:
+        if _is_missing_object(error):
+            return False
+        _raise_s3_error("exists", error)
+    except BotoCoreError as error:
+        _raise_s3_error("exists", error)
 
 
 def delete_dataset(stored_name: str, local_path: Path) -> None:
@@ -153,20 +284,14 @@ def delete_dataset(stored_name: str, local_path: Path) -> None:
         local_path.unlink(missing_ok=True)
         return
 
-    bucket_url = (
-        f"{settings.supabase_url.rstrip('/')}/storage/v1/object/"
-        f"{quote(settings.supabase_storage_bucket, safe='')}"
-    )
+    if settings.supabase_storage_driver == "rest":
+        _delete_dataset_rest(stored_name)
+        return
+
     try:
-        with httpx.Client(timeout=30) as client:
-            response = client.request(
-                "DELETE",
-                bucket_url,
-                json={"prefixes": [stored_name]},
-                headers=_headers(),
-            )
-            if response.status_code == 404:
-                return
-            response.raise_for_status()
-    except httpx.HTTPError as error:
-        _raise_cloud_error("delete", error)
+        _s3_client().delete_object(
+            Bucket=settings.supabase_storage_bucket,
+            Key=stored_name,
+        )
+    except (BotoCoreError, ClientError) as error:
+        _raise_s3_error("delete", error)

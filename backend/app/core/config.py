@@ -18,9 +18,17 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./intellibiz.db"
     auto_create_schema: bool = True
     data_storage_backend: Literal["local", "supabase"] = "local"
+    supabase_storage_driver: Literal["s3", "rest"] = "rest"
     supabase_url: str = ""
-    supabase_storage_bucket: str = "intellibiz-datasets"
+    supabase_storage_bucket: str = ""
+    supabase_secret_key: str = ""
     supabase_service_role_key: str = ""
+    supabase_s3_endpoint_url: str = (
+        "https://rxoxymrcccaqxbmqfazp.storage.supabase.co/storage/v1/s3"
+    )
+    supabase_s3_region: str = "ap-south-1"
+    supabase_s3_access_key_id: str = ""
+    supabase_s3_secret_access_key: str = ""
     access_token_expire_minutes: int = Field(default=720, ge=1, le=10080)
     cors_origins: str = "http://localhost:5173"
     max_upload_mb: int = Field(default=15, ge=1, le=500)
@@ -47,12 +55,82 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_production_configuration(self) -> "Settings":
         if self.data_storage_backend == "supabase":
-            if not self.supabase_url or not self.supabase_storage_bucket or not self.supabase_service_role_key:
-                raise ValueError(
-                    "Supabase storage requires SUPABASE_URL, SUPABASE_STORAGE_BUCKET, "
-                    "and SUPABASE_SERVICE_ROLE_KEY"
+            if not self.supabase_url.strip():
+                raise ValueError("Supabase storage requires SUPABASE_URL.")
+            try:
+                supabase_url = urlsplit(self.supabase_url.strip())
+                valid_supabase_url = (
+                    supabase_url.scheme == "https"
+                    and bool(supabase_url.hostname)
+                    and supabase_url.username is None
+                    and supabase_url.password is None
+                    and not supabase_url.query
+                    and not supabase_url.fragment
                 )
+            except ValueError:
+                valid_supabase_url = False
+            if not valid_supabase_url:
+                raise ValueError("SUPABASE_URL must be a valid HTTPS URL.")
+            if not self.supabase_storage_bucket.strip():
+                raise ValueError("Supabase storage requires SUPABASE_STORAGE_BUCKET.")
+            if self.supabase_secret_key.strip() and not self.supabase_secret_key.strip().startswith(
+                "sb_secret_"
+            ):
+                raise ValueError("SUPABASE_SECRET_KEY must use the sb_secret_ format.")
+            if not (
+                self.supabase_secret_key.strip()
+                or self.supabase_service_role_key.strip()
+            ):
+                raise ValueError(
+                    "Supabase storage requires SUPABASE_SECRET_KEY or "
+                    "SUPABASE_SERVICE_ROLE_KEY."
+                )
+            if self.supabase_storage_driver == "s3":
+                endpoint = urlsplit(self.supabase_s3_endpoint_url.strip())
+                if (
+                    endpoint.scheme != "https"
+                    or not endpoint.netloc
+                    or endpoint.query
+                    or endpoint.fragment
+                ):
+                    raise ValueError(
+                        "SUPABASE_S3_ENDPOINT_URL must be an HTTPS endpoint URL."
+                    )
+                if not self.supabase_s3_region.strip():
+                    raise ValueError(
+                        "Supabase S3 storage requires SUPABASE_S3_REGION."
+                    )
+                if not self.supabase_s3_access_key_id.strip():
+                    raise ValueError(
+                        "Supabase S3 storage requires SUPABASE_S3_ACCESS_KEY_ID."
+                    )
+                if not self.supabase_s3_secret_access_key.strip():
+                    raise ValueError(
+                        "Supabase S3 storage requires SUPABASE_S3_SECRET_ACCESS_KEY."
+                    )
         if self.environment.lower() in {"prod", "production"}:
+            database_url = self.database_url.strip()
+            try:
+                database = urlsplit(database_url)
+            except ValueError:
+                database = None
+            if (
+                database is None
+                or database.scheme not in {"postgresql", "postgresql+psycopg"}
+                or not database.hostname
+                or database.path in {"", "/"}
+            ):
+                raise ValueError(
+                    "Production requires DATABASE_URL to be a valid PostgreSQL URL "
+                    "using postgresql:// or postgresql+psycopg://."
+                )
+            if database.scheme == "postgresql":
+                self.database_url = "postgresql+psycopg://" + database_url.split(
+                    "://",
+                    1,
+                )[1]
+            else:
+                self.database_url = database_url
             if len(self.secret_key) < 32 or self.secret_key == "dev-only-change-this-secret-before-deploying":
                 raise ValueError("Production requires a unique SECRET_KEY of at least 32 characters")
             if self.auto_create_schema:
@@ -61,6 +139,10 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Production requires persistent object storage; configure "
                     "DATA_STORAGE_BACKEND=supabase and its credentials."
+                )
+            if self.supabase_storage_driver != "rest":
+                raise ValueError(
+                    "Production currently requires SUPABASE_STORAGE_DRIVER=rest."
                 )
             origins = {origin.strip() for origin in self.cors_origins.split(",") if origin.strip()}
             if not origins:

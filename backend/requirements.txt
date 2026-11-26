@@ -13,6 +13,7 @@ scikit-learn==1.6.1
 openpyxl==3.1.5
 reportlab==4.4.0
 httpx==0.28.1
+boto3==1.38.23
 openai==1.78.1
 google-generativeai==0.8.5
 pytest==9.0.3

@@ -1,11 +1,13 @@
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import jwt
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -335,6 +337,7 @@ def test_dataset_upload_rejects_duplicate_content_for_same_user(auth_client, tmp
     client, test_session = auth_client
     registration = register(client, "upload@example.com")
     token = login(client, "upload@example.com").json()["access_token"]
+    monkeypatch.setattr(settings, "data_storage_backend", "local")
     monkeypatch.setattr(api_routes, "DATA_DIR", tmp_path)
     headers = {"Authorization": f"Bearer {token}"}
     content = b"region,revenue\nNorth,100\n"
@@ -356,6 +359,127 @@ def test_dataset_upload_rejects_duplicate_content_for_same_user(auth_client, tmp
         rows = db.query(Dataset).filter(Dataset.owner_id == registration.json()["user"]["id"]).all()
         assert len(rows) == 1
     assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_dataset_upload_flushes_database_row_before_storage_write(
+    auth_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, test_session = auth_client
+    register(client, "flush-upload@example.com")
+    token = login(client, "flush-upload@example.com").json()["access_token"]
+    monkeypatch.setattr(settings, "data_storage_backend", "local")
+    monkeypatch.setattr(api_routes, "DATA_DIR", tmp_path)
+    inserts = []
+
+    def observe_sql(_connection, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().lower().startswith("insert into datasets"):
+            inserts.append(statement)
+
+    def save_after_flush(stored_name, content, local_path):
+        assert inserts, "Dataset INSERT must be flushed before storage write"
+        Path(local_path).write_bytes(content)
+
+    monkeypatch.setattr(api_routes, "save_stored_dataset", save_after_flush)
+    engine = test_session.kw["bind"]
+    event.listen(engine, "before_cursor_execute", observe_sql)
+    try:
+        response = client.post(
+            "/api/v1/datasets/upload",
+            headers={"Authorization": f"Bearer {token}"},
+            files={"file": ("sales.csv", b"region,revenue\nNorth,100\n", "text/csv")},
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", observe_sql)
+
+    assert response.status_code == 200
+    assert len(inserts) == 1
+
+
+def test_dataset_key_collision_retries_before_storage_write(
+    auth_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, test_session = auth_client
+    registration = register(client, "key-collision@example.com")
+    token = login(client, "key-collision@example.com").json()["access_token"]
+    user_id = registration.json()["user"]["id"]
+    monkeypatch.setattr(settings, "data_storage_backend", "local")
+    monkeypatch.setattr(api_routes, "DATA_DIR", tmp_path)
+    with test_session() as db:
+        db.add(
+            Dataset(
+                owner_id=user_id,
+                name="existing.csv",
+                stored_name="collision.csv",
+                content_hash=None,
+                row_count=1,
+                column_count=1,
+                file_size=0,
+            )
+        )
+        db.commit()
+
+    keys = iter(("collision", "fresh-key"))
+    monkeypatch.setattr(
+        api_routes,
+        "uuid4",
+        lambda: SimpleNamespace(hex=next(keys)),
+    )
+    uploaded_keys = []
+
+    def record_upload(stored_name, content, local_path):
+        uploaded_keys.append(stored_name)
+        Path(local_path).write_bytes(content)
+
+    monkeypatch.setattr(api_routes, "save_stored_dataset", record_upload)
+    response = client.post(
+        "/api/v1/datasets/upload",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"file": ("sales.csv", b"region,revenue\nNorth,100\n", "text/csv")},
+    )
+
+    assert response.status_code == 200
+    assert uploaded_keys == ["fresh-key.csv"]
+    with test_session() as db:
+        assert db.query(Dataset).filter_by(stored_name="collision.csv").count() == 1
+        assert db.query(Dataset).filter_by(stored_name="fresh-key.csv").count() == 1
+
+
+def test_dataset_upload_failure_rolls_back_without_cloud_cleanup(
+    auth_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, test_session = auth_client
+    registration = register(client, "failed-upload@example.com")
+    token = login(client, "failed-upload@example.com").json()["access_token"]
+    user_id = registration.json()["user"]["id"]
+    monkeypatch.setattr(settings, "data_storage_backend", "local")
+    monkeypatch.setattr(api_routes, "DATA_DIR", tmp_path)
+    cleanup_calls = []
+
+    def fail_upload(*_args):
+        raise api_routes.DatasetStorageError("simulated upload failure")
+
+    monkeypatch.setattr(api_routes, "save_stored_dataset", fail_upload)
+    monkeypatch.setattr(
+        api_routes,
+        "remove_stored_dataset",
+        lambda *args: cleanup_calls.append(args),
+    )
+    response = client.post(
+        "/api/v1/datasets/upload",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"file": ("sales.csv", b"region,revenue\nNorth,100\n", "text/csv")},
+    )
+
+    assert response.status_code == 503
+    assert cleanup_calls == []
+    with test_session() as db:
+        assert db.query(Dataset).filter(Dataset.owner_id == user_id).count() == 0
 
 
 def test_dataset_upload_sanitizes_parser_errors(auth_client, tmp_path, monkeypatch):
@@ -428,7 +552,10 @@ def test_dataset_upload_detects_legacy_duplicate_without_saved_hash(auth_client,
     assert "legacy.csv" in response.json()["detail"]
 
 
-def test_dataset_delete_reports_storage_failure_without_removing_record(auth_client, monkeypatch):
+def test_dataset_delete_reports_storage_cleanup_failure_after_record_commit(
+    auth_client,
+    monkeypatch,
+):
     client, test_session = auth_client
     registration = register(client, "storage-delete@example.com")
     token = login(client, "storage-delete@example.com").json()["access_token"]
@@ -446,6 +573,8 @@ def test_dataset_delete_reports_storage_failure_without_removing_record(auth_cli
         dataset_id = dataset.id
 
     def fail_delete(*_args):
+        with test_session() as db:
+            assert db.query(Dataset).filter(Dataset.id == dataset_id).one_or_none() is None
         raise api_routes.DatasetStorageError("provider detail must not escape")
 
     monkeypatch.setattr(api_routes, "remove_stored_dataset", fail_delete)
@@ -455,7 +584,58 @@ def test_dataset_delete_reports_storage_failure_without_removing_record(auth_cli
     )
 
     assert response.status_code == 503
-    assert response.json()["detail"] == "Dataset storage is unavailable. Please retry later."
+    assert response.json()["detail"] == (
+        "Dataset record was deleted, but storage cleanup failed. Please contact support."
+    )
+    with test_session() as db:
+        assert db.query(Dataset).filter(Dataset.id == dataset_id).one_or_none() is None
+
+
+def test_dataset_delete_commit_failure_does_not_remove_storage(
+    auth_client,
+    monkeypatch,
+):
+    client, test_session = auth_client
+    registration = register(client, "delete-commit-failure@example.com")
+    token = login(client, "delete-commit-failure@example.com").json()["access_token"]
+    dataset = Dataset(
+        owner_id=registration.json()["user"]["id"],
+        name="sales.csv",
+        stored_name="opaque-name.csv",
+        row_count=1,
+        column_count=1,
+        file_size=8,
+    )
+    with test_session() as db:
+        db.add(dataset)
+        db.commit()
+        dataset_id = dataset.id
+
+    original_commit = api_routes.Session.commit
+    cleanup_calls = []
+
+    def fail_delete_commit(session):
+        if any(
+            isinstance(item, Dataset) and item.id == dataset_id
+            for item in session.deleted
+        ):
+            raise SQLAlchemyError("simulated commit failure")
+        return original_commit(session)
+
+    monkeypatch.setattr(api_routes.Session, "commit", fail_delete_commit)
+    monkeypatch.setattr(
+        api_routes,
+        "remove_stored_dataset",
+        lambda *args: cleanup_calls.append(args),
+    )
+    response = client.delete(
+        f"/api/v1/datasets/{dataset_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Dataset could not be deleted. Please retry later."
+    assert cleanup_calls == []
     with test_session() as db:
         assert db.query(Dataset).filter(Dataset.id == dataset_id).one_or_none() is not None
 

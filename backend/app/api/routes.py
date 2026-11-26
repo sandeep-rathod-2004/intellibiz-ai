@@ -347,29 +347,61 @@ async def upload_dataset(file:UploadFile=File(...),user:User=Depends(get_current
             f"Dataset exceeds the {settings.max_dataset_cells:,}-cell processing limit.",
         )
 
-    stored = f"{uuid4().hex}{suffix}"
+    ds = None
+    stored = ""
+    for attempt in range(3):
+        stored = f"{uuid4().hex}{suffix}"
+        ds = Dataset(
+            owner_id=user.id,
+            name=(file.filename or "dataset")[:255],
+            stored_name=stored,
+            content_hash=content_hash,
+            row_count=len(df),
+            column_count=len(df.columns),
+            file_size=len(content),
+        )
+        db.add(ds)
+        try:
+            db.flush()
+        except IntegrityError as exc:
+            db.rollback()
+            if db.query(Dataset).filter(
+                Dataset.owner_id == user.id,
+                Dataset.content_hash == content_hash,
+            ).first():
+                raise HTTPException(
+                    409,
+                    "This file has already been uploaded",
+                ) from exc
+            if (
+                db.query(Dataset)
+                .filter(Dataset.stored_name == stored)
+                .first()
+                and attempt < 2
+            ):
+                continue
+            raise
+        break
+    else:
+        raise HTTPException(503, "Could not reserve a unique dataset storage key.")
+
+    if ds is None:
+        raise HTTPException(503, "Could not reserve a unique dataset storage key.")
+
     path = DATA_DIR / stored
     try:
         await asyncio.to_thread(save_stored_dataset, stored, content, path)
     except DatasetStorageError as exc:
+        db.rollback()
         raise HTTPException(503, "Dataset storage is unavailable. Please retry later.") from exc
+    except OSError:
+        db.rollback()
+        raise
 
-    ds = Dataset(
-        owner_id=user.id,
-        name=(file.filename or "dataset")[:255],
-        stored_name=stored,
-        content_hash=content_hash,
-        row_count=len(df),
-        column_count=len(df.columns),
-        file_size=len(content),
-    )
-    db.add(ds)
     try:
         db.commit()
-        db.refresh(ds)
     except IntegrityError as exc:
         db.rollback()
-        await asyncio.to_thread(remove_stored_dataset, stored, path)
         if db.query(Dataset).filter(
             Dataset.owner_id == user.id,
             Dataset.content_hash == content_hash,
@@ -378,8 +410,8 @@ async def upload_dataset(file:UploadFile=File(...),user:User=Depends(get_current
         raise
     except SQLAlchemyError:
         db.rollback()
-        await asyncio.to_thread(remove_stored_dataset, stored, path)
         raise
+    db.refresh(ds)
     return {"id":ds.id,"name":ds.name,"rows":ds.row_count,"columns":ds.column_count,"size":ds.file_size}
 @router.get('/datasets')
 def list_datasets(user:User=Depends(get_current_user),db:Session=Depends(get_db)):
@@ -472,18 +504,41 @@ def download_retail_sample():
 @router.delete('/datasets/{dataset_id}')
 def delete_dataset(dataset_id:int,user:User=Depends(get_current_user),db:Session=Depends(get_db)):
     ds=owned_dataset(dataset_id,user,db)
+    stored_name = ds.stored_name
+    stored_path = DATA_DIR / stored_name
+    deleted_dataset_id = ds.id
     db.query(CopilotConversation).filter(
         CopilotConversation.dataset_id == ds.id,
     ).update(
         {CopilotConversation.dataset_id: None},
         synchronize_session=False,
     )
-    try:
-        remove_stored_dataset(ds.stored_name, DATA_DIR / ds.stored_name)
-    except DatasetStorageError as exc:
-        raise HTTPException(503, "Dataset storage is unavailable. Please retry later.") from exc
     db.delete(ds)
-    db.commit()
+    try:
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error(
+            "Dataset deletion transaction failed dataset_id=%s exception=%s",
+            deleted_dataset_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            503,
+            "Dataset could not be deleted. Please retry later.",
+        ) from exc
+    try:
+        remove_stored_dataset(stored_name, stored_path)
+    except (DatasetStorageError, OSError) as exc:
+        logger.error(
+            "Dataset record deleted but storage cleanup failed dataset_id=%s exception=%s",
+            deleted_dataset_id,
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            503,
+            "Dataset record was deleted, but storage cleanup failed. Please contact support.",
+        ) from exc
     return {"deleted":True}
 @router.get('/datasets/{dataset_id}/analysis')
 def get_analysis(dataset_id:int,user:User=Depends(get_current_user),db:Session=Depends(get_db)):
