@@ -81,6 +81,7 @@ def test_supabase_upload_uses_private_authenticated_object_request(
         assert request.headers["authorization"] == "Bearer test-service-role-key"
         assert request.headers["apikey"] == "test-service-role-key"
         assert request.headers["x-upsert"] == "false"
+        assert request.headers["content-type"] == "text/csv"
         assert request.content == content
         return httpx.Response(200, request=request)
 
@@ -106,6 +107,26 @@ def test_supabase_secret_key_uses_apikey_without_bearer_authorization(
 
     install_transport(monkeypatch, handler)
     storage.save_dataset("dataset.csv", content, tmp_path / "dataset.csv")
+
+
+def test_supabase_xlsx_upload_uses_xlsx_media_type(
+    monkeypatch,
+    supabase_storage,
+    tmp_path,
+):
+    content = b"xlsx bytes"
+
+    def handler(request):
+        assert request.method == "POST"
+        assert request.headers["content-type"] == (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        assert request.headers["x-upsert"] == "false"
+        assert request.content == content
+        return httpx.Response(200, request=request)
+
+    install_transport(monkeypatch, handler)
+    storage.save_dataset("dataset.xlsx", content, tmp_path / "dataset.xlsx")
 
 
 def test_supabase_download_returns_bytes_and_maps_missing_object(
@@ -314,6 +335,97 @@ def test_supabase_errors_are_sanitized(
         storage.save_dataset("dataset.csv", b"data", tmp_path / "dataset.csv")
 
     assert "test-service-role-key" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected_category"),
+    [
+        (400, {"statusCode": "415", "error": "InvalidMimeType", "message": "mime type not supported"}, "unsupported_media_type"),
+        (400, {"error": "InvalidKey", "message": "invalid object path"}, "invalid_bucket_or_object_path"),
+        (400, {"error": "InvalidRequest", "message": "malformed request"}, "invalid_upload_request"),
+        (401, {"error": "Unauthorized", "message": "bad credentials"}, "authentication_or_authorization"),
+        (403, {"error": "AccessDenied", "message": "policy denied"}, "authentication_or_authorization"),
+        (404, {"error": "BucketNotFound", "message": "bucket not found"}, "missing_bucket_or_object"),
+    ],
+)
+def test_supabase_http_errors_log_safe_classification(
+    monkeypatch,
+    supabase_storage,
+    tmp_path,
+    caplog,
+    status,
+    body,
+    expected_category,
+):
+    warning = Mock()
+    monkeypatch.setattr(storage.logger, "warning", warning)
+    install_transport(
+        monkeypatch,
+        lambda request: httpx.Response(status, json=body, request=request),
+    )
+
+    with pytest.raises(storage.DatasetStorageError) as raised:
+        storage.save_dataset("dataset.csv", b"private-file-content", tmp_path / "dataset.csv")
+
+    logged = warning.call_args.args[0] % warning.call_args.args[1:]
+    assert "private-file-content" not in logged
+    assert "test-service-role-key" not in logged
+    assert "test-service-role-key" not in str(raised.value)
+    assert f"http_status={status}" in logged
+    assert f"category={expected_category}" in logged
+    if body.get("message"):
+        assert body["message"] in logged
+
+
+def test_supabase_error_log_redacts_credentials_and_truncates_message(
+    monkeypatch,
+    supabase_storage,
+    tmp_path,
+    caplog,
+):
+    sensitive = "sb_secret_do-not-log"
+    warning = Mock()
+    monkeypatch.setattr(storage.logger, "warning", warning)
+    long_message = f"credential={sensitive} " + ("x" * 400)
+    install_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            400,
+            json={"error": "InvalidRequest", "message": long_message},
+            request=request,
+        ),
+    )
+
+    with pytest.raises(storage.DatasetStorageError):
+        storage.save_dataset("dataset.csv", b"secret file bytes", tmp_path / "dataset.csv")
+
+    logged = warning.call_args.args[0] % warning.call_args.args[1:]
+    assert sensitive not in logged
+    assert "secret file bytes" not in logged
+    logged_message = warning.call_args.args[-1]
+    assert len(logged_message.strip()) <= 240
+
+
+def test_supabase_upload_network_timeout_is_sanitized(
+    monkeypatch,
+    supabase_storage,
+    tmp_path,
+    caplog,
+):
+    warning = Mock()
+    monkeypatch.setattr(storage.logger, "warning", warning)
+    install_transport(
+        monkeypatch,
+        lambda request: (_ for _ in ()).throw(httpx.ReadTimeout("timeout")),
+    )
+
+    with pytest.raises(storage.DatasetStorageError):
+        storage.save_dataset("dataset.csv", b"private-file-content", tmp_path / "dataset.csv")
+
+    logged = warning.call_args.args[0] % warning.call_args.args[1:]
+    assert "http_status=None" in logged
+    assert "private-file-content" not in logged
+    assert "test-service-role-key" not in logged
 
 
 def test_storage_readiness_requires_a_reachable_private_bucket(

@@ -1,4 +1,5 @@
 import logging
+import re
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import quote
@@ -73,13 +74,17 @@ def _raise_s3_error(operation: str, error: BotoCoreError | ClientError) -> NoRet
 
 
 def _save_dataset_rest(stored_name: str, content: bytes) -> None:
+    content_type = {
+        ".csv": "text/csv",
+        ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }.get(Path(stored_name).suffix.lower(), "application/octet-stream")
     try:
         with httpx.Client(timeout=30) as client:
             response = client.post(
                 _object_url(stored_name),
                 content=content,
                 headers={
-                    **_headers("application/octet-stream"),
+                    **_headers(content_type),
                     "x-upsert": "false",
                 },
             )
@@ -190,13 +195,65 @@ def storage_readiness() -> dict[str, str | bool]:
 
 def _raise_cloud_error(operation: str, error: httpx.HTTPError) -> NoReturn:
     status_code = error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None
+    safe_fields: dict[str, str] = {}
+    category = "network_error"
+    if isinstance(error, httpx.HTTPStatusError):
+        body = _safe_supabase_error_body(error.response)
+        safe_fields = body
+        normalized = " ".join(body.values()).lower()
+        if status_code in {401, 403}:
+            category = "authentication_or_authorization"
+        elif status_code == 404 and any(term in normalized for term in ("bucket", "not found")):
+            category = "missing_bucket_or_object"
+        elif status_code == 400:
+            if any(term in normalized for term in ("mime", "content type", "media type")):
+                category = "unsupported_media_type"
+            elif any(term in normalized for term in ("bucket", "invalidkey", "invalid key", "object path")):
+                category = "invalid_bucket_or_object_path"
+            else:
+                category = "invalid_upload_request"
+        elif any(term in normalized for term in ("tenant", "configuration", "project not found")):
+            category = "storage_configuration_error"
+        elif status_code is not None:
+            category = "storage_http_error"
     logger.warning(
-        "Dataset storage request failed backend=supabase operation=%s exception=%s http_status=%s",
+        "Dataset storage request failed backend=supabase operation=%s exception=%s http_status=%s category=%s supabase_error=%s supabase_status=%s supabase_message=%s",
         operation,
         type(error).__name__,
         status_code,
+        category,
+        safe_fields.get("error", ""),
+        safe_fields.get("statusCode", ""),
+        safe_fields.get("message", ""),
     )
     raise DatasetStorageError("Cloud dataset storage is unavailable or misconfigured.") from error
+
+
+_SENSITIVE_VALUE = re.compile(
+    r"(?i)(sb_secret_[A-Za-z0-9_-]+|eyJ[A-Za-z0-9_.-]{20,}|(?:bearer|token|key|password|secret)\s*[:=]?\s*[^\s,;]+)"
+)
+
+
+def _sanitize_error_value(value: object) -> str:
+    if not isinstance(value, (str, int, float, bool)):
+        return ""
+    text = " ".join(str(value).split())
+    text = _SENSITIVE_VALUE.sub("[redacted]", text)
+    return text[:240]
+
+
+def _safe_supabase_error_body(response: httpx.Response) -> dict[str, str]:
+    try:
+        body = response.json()
+    except ValueError:
+        return {}
+    if not isinstance(body, dict):
+        return {}
+    return {
+        name: value
+        for name in ("statusCode", "error", "message")
+        if (value := _sanitize_error_value(body.get(name)))
+    }
 
 
 def save_dataset(stored_name: str, content: bytes, local_path: Path) -> None:
