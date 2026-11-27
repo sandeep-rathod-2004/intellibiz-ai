@@ -118,3 +118,56 @@ def test_migration_is_safe_when_create_all_already_added_copilot_tables(tmp_path
         assert migrated.execute("SELECT COUNT(*) FROM copilot_conversations").fetchone()[0] == 1
         assert migrated.execute("SELECT COUNT(*) FROM copilot_messages").fetchone()[0] == 1
         assert migrated.execute("SELECT context_mode FROM copilot_conversations").fetchone()[0] == "dataset"
+
+
+def test_context_mode_migration_preserves_existing_production_records(tmp_path, monkeypatch):
+    database_path = tmp_path / "pre-0004.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend_dir = Path(__file__).resolve().parents[1]
+    migration_config = Config(str(backend_dir / "alembic.ini"))
+    migration_config.set_main_option("script_location", str(backend_dir / "migrations"))
+
+    command.upgrade(migration_config, "0003_copilot_conversations")
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO users (email, full_name, hashed_password, created_at) "
+            "VALUES ('migration-preserve@example.com', 'Existing', 'hash', CURRENT_TIMESTAMP)"
+        ))
+        user_id = connection.execute(text(
+            "SELECT id FROM users WHERE email='migration-preserve@example.com'"
+        )).scalar_one()
+        connection.execute(text(
+            "INSERT INTO datasets "
+            "(owner_id, name, stored_name, row_count, column_count, file_size, created_at, content_hash) "
+            "VALUES (:owner, 'records.csv', 'opaque-records.csv', 1, 1, 7, CURRENT_TIMESTAMP, 'hash-value')"
+        ), {"owner": user_id})
+        dataset_id = connection.execute(text(
+            "SELECT id FROM datasets WHERE stored_name='opaque-records.csv'"
+        )).scalar_one()
+        connection.execute(text(
+            "INSERT INTO copilot_conversations "
+            "(owner_id, dataset_id, title, created_at, updated_at) "
+            "VALUES (:owner, :dataset, 'Keep this title', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        ), {"owner": user_id, "dataset": dataset_id})
+        conversation_id = connection.execute(text(
+            "SELECT id FROM copilot_conversations WHERE title='Keep this title'"
+        )).scalar_one()
+        connection.execute(text(
+            "INSERT INTO copilot_messages (conversation_id, role, content, created_at) "
+            "VALUES (:conversation, 'user', 'Keep this message', CURRENT_TIMESTAMP)"
+        ), {"conversation": conversation_id})
+    engine.dispose()
+
+    command.upgrade(migration_config, "0004_copilot_context_mode")
+
+    with sqlite3.connect(database_path) as migrated:
+        assert migrated.execute("SELECT email FROM users").fetchone()[0] == "migration-preserve@example.com"
+        assert migrated.execute("SELECT stored_name FROM datasets").fetchone()[0] == "opaque-records.csv"
+        conversation = migrated.execute(
+            "SELECT dataset_id, title, context_mode FROM copilot_conversations"
+        ).fetchone()
+        assert conversation == (dataset_id, "Keep this title", "dataset")
+        assert migrated.execute("SELECT content FROM copilot_messages").fetchone()[0] == "Keep this message"
+        assert migrated.execute("SELECT version_num FROM alembic_version").fetchone()[0] == "0004_copilot_context_mode"

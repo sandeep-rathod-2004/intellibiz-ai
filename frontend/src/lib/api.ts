@@ -1,4 +1,5 @@
 import axios from "axios";
+import {transportErrorMessage} from "./transportError";
 const apiBaseURL = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? "http://localhost:8000/api/v1" : "");
 if (import.meta.env.PROD && !apiBaseURL) {
   throw new Error("VITE_API_URL must be configured for production.");
@@ -34,6 +35,14 @@ export function errorRetryInfo(error: unknown): ApiRetryInfo {
 
 export function errorMessage(error: unknown): string {
   if (axios.isAxiosError<{detail?: unknown}>(error)) {
+    if (!error.response) {
+      return transportErrorMessage({
+        code: error.code,
+        baseURL: error.config?.baseURL,
+        requestURL: error.config?.url,
+        browserOrigin: typeof window === "undefined" ? undefined : window.location.origin,
+      });
+    }
     const detail = error.response?.data?.detail;
     let message: string | undefined;
     if (typeof detail === "string") {

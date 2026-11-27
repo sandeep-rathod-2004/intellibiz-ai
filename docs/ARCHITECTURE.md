@@ -7,7 +7,7 @@
 3. Uploads are restricted to CSV/XLSX, stored under generated opaque object names, and represented by SQLAlchemy `Dataset` records. Development storage is local; production requires the configured private Supabase Storage bucket.
 4. Pandas computes dataset profiles, quality metrics, and business summaries. Scikit-learn powers a Random Forest baseline forecast and Isolation Forest anomaly detection.
 5. Copilot first handles supported questions from deterministic computed facts. Other questions may use the configured server-side Groq, OpenAI, or Gemini provider. Prompts are bounded and exclude source preview rows; conversations and messages persist in SQL.
-6. Alembic owns schema evolution. Its three revisions create missing baseline tables and add dataset hashes and Copilot persistence without replacing existing rows.
+6. Alembic owns schema evolution. Its revisions create missing baseline tables and add dataset hashes, Copilot persistence, and conversation context mode without replacing existing rows.
 
 ## Security boundaries
 
@@ -19,7 +19,8 @@
 
 ## Deployment and operational boundaries
 
-- The backend Docker image runs `alembic upgrade head` before Uvicorn. Run one API worker unless migrations are run as a separate single pre-deploy step and rate limiting is provided by a shared gateway.
+- The backend Docker image runs `alembic upgrade head` before Uvicorn only when `RUN_MIGRATIONS=true` is explicitly set. The default is false; for a schema-dependent release, either set the variable or apply the migration as a single pre-deploy step. Run one API worker unless migrations are handled as a separate single pre-deploy step and rate limiting is provided by a shared gateway.
+- Dataset rows are stored as original CSV/XLSX objects under unique opaque keys in private Supabase Storage; PostgreSQL stores owner-scoped metadata and upload hashes. Data Explorer parses the selected object to derive the real column names and page rows. It deliberately avoids creating a physical SQL table per user upload, so arbitrary headers never become SQL identifiers.
 - The frontend Docker image serves the Vite build through Nginx with SPA history fallback. Vercel deployments need a build-time public `VITE_API_URL`; the local example URL is development-only.
 - SQLite and local files are for development. Hosted PostgreSQL and persistent object storage must be configured and independently backed up. A PostgreSQL migration, restore rehearsal, external storage verification, and live deployment were not performed as part of this repository audit.
 - API throttling is currently in-process and does not coordinate across workers or instances. A shared limiter/WAF, observability/alerting, and backup automation remain operator responsibilities.

@@ -1,12 +1,14 @@
 import json
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import jwt
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -359,6 +361,71 @@ def test_dataset_upload_rejects_duplicate_content_for_same_user(auth_client, tmp
         rows = db.query(Dataset).filter(Dataset.owner_id == registration.json()["user"]["id"]).all()
         assert len(rows) == 1
     assert len(list(tmp_path.iterdir())) == 1
+
+
+def test_independent_csv_and_excel_uploads_keep_dynamic_schemas_and_rows(
+    auth_client,
+    tmp_path,
+    monkeypatch,
+):
+    client, test_session = auth_client
+    registration = register(client, "dynamic-schema@example.com")
+    user_id = registration.json()["user"]["id"]
+    token = login(client, "dynamic-schema@example.com").json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(settings, "data_storage_backend", "local")
+    monkeypatch.setattr(api_routes, "DATA_DIR", tmp_path)
+
+    csv_content = b"Region / Area,Revenue ($),Revenue ($),Store Open\nNorth,125.5,500,true\nSouth,,800,false\n"
+    excel_buffer = BytesIO()
+    pd.DataFrame({
+        "Ticket #": ["T-100", "T-101"],
+        "Minutes elapsed": [12, 28],
+        "Resolution?": ["yes", "no"],
+    }).to_excel(excel_buffer, index=False)
+    excel_content = excel_buffer.getvalue()
+
+    csv_upload = client.post(
+        "/api/v1/datasets/upload",
+        headers=headers,
+        files={"file": ("quarter.csv", csv_content, "text/csv")},
+    )
+    xlsx_upload = client.post(
+        "/api/v1/datasets/upload",
+        headers=headers,
+        files={
+            "file": (
+                "support.xlsx",
+                excel_content,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+
+    assert csv_upload.status_code == 200
+    assert xlsx_upload.status_code == 200
+    csv_id = csv_upload.json()["id"]
+    xlsx_id = xlsx_upload.json()["id"]
+    assert csv_id != xlsx_id
+    csv_preview = client.get(f"/api/v1/datasets/{csv_id}/preview", headers=headers)
+    xlsx_preview = client.get(f"/api/v1/datasets/{xlsx_id}/preview", headers=headers)
+    assert csv_preview.status_code == xlsx_preview.status_code == 200
+    assert csv_preview.json()["columns"] == [
+        "Region / Area", "Revenue ($)", "Revenue ($).1", "Store Open",
+    ]
+    assert csv_preview.json()["rows"] == [
+        {"Region / Area": "North", "Revenue ($)": 125.5, "Revenue ($).1": 500, "Store Open": True},
+        {"Region / Area": "South", "Revenue ($)": None, "Revenue ($).1": 800, "Store Open": False},
+    ]
+    assert xlsx_preview.json()["columns"] == ["Ticket #", "Minutes elapsed", "Resolution?"]
+    assert xlsx_preview.json()["rows"][0] == {
+        "Ticket #": "T-100", "Minutes elapsed": 12, "Resolution?": "yes",
+    }
+    assert len(list(tmp_path.iterdir())) == 2
+    with test_session() as db:
+        stored = db.query(Dataset).filter(Dataset.owner_id == user_id).all()
+        assert len(stored) == 2
+        assert len({dataset.stored_name for dataset in stored}) == 2
 
 
 def test_dataset_upload_flushes_database_row_before_storage_write(
@@ -974,6 +1041,32 @@ def test_general_copilot_conversations_are_independent_persisted_and_contextual(
         json={"context_mode": "dataset"},
         headers=headers,
     ).status_code == 422
+
+
+def test_missing_context_mode_column_returns_cors_readable_copilot_errors(auth_client):
+    client, test_session = auth_client
+    register(client, "missing-context-mode@example.com")
+    token = login(client, "missing-context-mode@example.com").json()["access_token"]
+    with test_session.kw["bind"].begin() as connection:
+        connection.execute(text("ALTER TABLE copilot_conversations DROP COLUMN context_mode"))
+
+    diagnostic_client = TestClient(app, raise_server_exceptions=False)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Origin": "http://localhost:5173",
+    }
+    history = diagnostic_client.get("/api/v1/copilot/conversations", headers=headers)
+    created = diagnostic_client.post(
+        "/api/v1/copilot/conversations",
+        json={"context_mode": "general", "dataset_id": None},
+        headers=headers,
+    )
+
+    for response in (history, created):
+        assert response.status_code == 500
+        assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
+        assert response.headers.get("x-request-id")
+        assert response.json()["detail"] == "An unexpected server error occurred"
 
 
 def test_copilot_history_is_user_scoped_and_deletion_preserves_other_domains(auth_client):

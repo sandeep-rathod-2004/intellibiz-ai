@@ -87,11 +87,24 @@ async def unexpected_error(request: Request, exc: Exception):
         request_id,
         type(exc).__name__,
     )
+    headers = {"X-Request-ID": request_id}
+    origin = request.headers.get("origin")
+    # ServerErrorMiddleware generates this response outside the regular CORS
+    # middleware. Preserve CORS for explicitly allowed origins so the browser
+    # can read the sanitized 500 response and its request ID instead of reporting
+    # a misleading Axios "Network Error".
+    if origin and origin in origins:
+        headers.update({
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Expose-Headers": "X-Request-ID",
+            "Vary": "Origin",
+        })
     return JSONResponse(
         status_code=500,
         content={
             "detail": "An unexpected server error occurred",
             "request_id": request_id,
         },
-        headers={"X-Request-ID": request_id},
+        headers=headers,
     )
