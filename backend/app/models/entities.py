@@ -47,6 +47,9 @@ class CopilotConversation(Base):
         ForeignKey("datasets.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Existing conversations were created only for selected datasets. Keep that
+    # meaning if a linked dataset is later deleted (dataset_id becomes NULL).
+    context_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="dataset", server_default="dataset")
     title: Mapped[str] = mapped_column(String(160), default="New conversation")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

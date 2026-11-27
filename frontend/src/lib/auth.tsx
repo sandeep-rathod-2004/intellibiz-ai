@@ -87,7 +87,7 @@ export function AuthProvider({children}: {children: ReactNode}) {
     const controller = new AbortController();
     setLoading(true);
     setSessionError(null);
-    api.get<UserProfile>("/auth/me", {signal: controller.signal})
+    api.get<UserProfile>("/auth/me", {signal: controller.signal, timeout:12000})
       .then(response => setUser(response.data))
       .catch(error => {
         if (controller.signal.aborted) return;
@@ -121,7 +121,7 @@ export function AuthProvider({children}: {children: ReactNode}) {
 
   const logout = useCallback(async () => {
     try {
-      await api.post("/auth/logout");
+      await api.post("/auth/logout", undefined, {timeout:8000});
     } finally {
       clearSession();
     }

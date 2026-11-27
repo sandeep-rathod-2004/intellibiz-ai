@@ -103,6 +103,7 @@ class ChatIn(BaseModel):
 
 class ConversationCreateIn(BaseModel):
     dataset_id: int | None = Field(default=None, gt=0)
+    context_mode: Literal["general", "dataset"] | None = None
 
 
 class ConversationRenameIn(BaseModel):
@@ -256,7 +257,8 @@ def conversation_payload(conversation: CopilotConversation) -> dict[str, Any]:
     return {
         "id": conversation.id,
         "dataset_id": conversation.dataset_id,
-        "dataset_available": conversation.dataset_id is not None,
+        "context_mode": conversation.context_mode,
+        "dataset_available": conversation.context_mode == "dataset" and conversation.dataset_id is not None,
         "title": conversation.title,
         "created_at": conversation.created_at.isoformat(),
         "updated_at": conversation.updated_at.isoformat(),
@@ -710,11 +712,17 @@ def create_copilot_conversation(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    context_mode = payload.context_mode or ("dataset" if payload.dataset_id is not None else "general")
+    if context_mode == "dataset" and payload.dataset_id is None:
+        raise HTTPException(422, "Select an available dataset for a dataset-focused conversation.")
+    if context_mode == "general" and payload.dataset_id is not None:
+        raise HTTPException(422, "General conversations cannot be linked to a dataset.")
     if payload.dataset_id is not None:
         owned_dataset(payload.dataset_id, user, db)
     conversation = CopilotConversation(
         owner_id=user.id,
         dataset_id=payload.dataset_id,
+        context_mode=context_mode,
         title="New conversation",
     )
     db.add(conversation)
@@ -835,17 +843,21 @@ async def answer_copilot_message(
             return message_payload(next_message)
         raise HTTPException(409, "Only the latest unanswered Copilot message can be retried.")
 
-    if conversation.dataset_id is None:
-        raise HTTPException(409, "This conversation's dataset is unavailable. Its history has been preserved.")
-    dataset = owned_dataset(conversation.dataset_id, user, db)
-    frame = await asyncio.to_thread(load, dataset)
-    dataset_profile = profile(frame, include_all_summaries=True)
-    dataset_profile.pop("preview", None)
-    facts = {
-        "dataset": dataset.name,
-        "profile": dataset_profile,
-        "insights": insights(frame, dataset_profile),
-    }
+    if conversation.context_mode == "dataset":
+        if conversation.dataset_id is None:
+            raise HTTPException(409, "This conversation's dataset is unavailable. Its history has been preserved.")
+        dataset = owned_dataset(conversation.dataset_id, user, db)
+        frame = await asyncio.to_thread(load, dataset)
+        dataset_profile = profile(frame, include_all_summaries=True)
+        dataset_profile.pop("preview", None)
+        facts = {
+            "context_mode": "dataset",
+            "dataset": dataset.name,
+            "profile": dataset_profile,
+            "insights": insights(frame, dataset_profile),
+        }
+    else:
+        facts = {"context_mode": "general"}
     question = message.content
     history_rows = db.query(CopilotMessage).filter(
         CopilotMessage.conversation_id == conversation_id,

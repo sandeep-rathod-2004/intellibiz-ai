@@ -3,7 +3,9 @@ const apiBaseURL = import.meta.env.VITE_API_URL || (import.meta.env.DEV ? "http:
 if (import.meta.env.PROD && !apiBaseURL) {
   throw new Error("VITE_API_URL must be configured for production.");
 }
-export const api=axios.create({baseURL:apiBaseURL});
+// Bound every request so a stalled network cannot leave the UI loading forever.
+// Long-running Copilot requests can override this at the call site.
+export const api=axios.create({baseURL:apiBaseURL, timeout:30000});
 api.interceptors.request.use(c=>{const t=localStorage.getItem("ib_token");if(t)c.headers.Authorization=`Bearer ${t}`;return c});
 
 export interface ApiRetryInfo {

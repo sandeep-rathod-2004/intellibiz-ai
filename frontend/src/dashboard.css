@@ -112,6 +112,9 @@
 .copilot-history{display:flex;flex-direction:column;min-height:590px;max-height:calc(100vh - 180px);padding:13px}
 .copilot-history-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:12px}
 .copilot-history-head h3{margin-top:5px;font:600 15px 'Space Grotesk'}
+.copilot-new-chat-mode{display:grid;gap:5px;margin:0 0 8px;color:var(--muted);font-size:10px}
+.copilot-new-chat-mode select{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:9px;background:var(--surface);color:var(--text);font:inherit}
+.copilot-new-chat{width:100%;justify-content:center;margin-bottom:10px}
 .copilot-search{min-width:0;flex:none;margin-bottom:10px}
 .copilot-history-hint,.copilot-history-empty{padding:9px;color:var(--muted);font-size:9px;line-height:1.5}
 .copilot-history-list{flex:1;min-height:0;overflow:auto}

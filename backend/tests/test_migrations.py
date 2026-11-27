@@ -66,7 +66,10 @@ def test_migrations_preserve_existing_users_and_additive_schema(tmp_path, monkey
             "copilot_conversations",
             "copilot_messages",
         }.issubset(set(inspect(migrated).get_table_names()))
-        assert migrated.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0003_copilot_conversations"
+        assert migrated.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "0004_copilot_context_mode"
+        assert "context_mode" in {
+            column["name"] for column in inspect(migrated).get_columns("copilot_conversations")
+        }
     engine.dispose()
 
 
@@ -114,3 +117,4 @@ def test_migration_is_safe_when_create_all_already_added_copilot_tables(tmp_path
         assert migrated.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 1
         assert migrated.execute("SELECT COUNT(*) FROM copilot_conversations").fetchone()[0] == 1
         assert migrated.execute("SELECT COUNT(*) FROM copilot_messages").fetchone()[0] == 1
+        assert migrated.execute("SELECT context_mode FROM copilot_conversations").fetchone()[0] == "dataset"

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 from io import BytesIO
 from types import SimpleNamespace
@@ -765,6 +766,34 @@ def test_local_copilot_explains_unavailable_monthly_growth(monkeypatch):
 
     assert "month-over-month growth is unavailable" in result["answer"].lower()
     assert "immediately preceding calendar month is missing" in result["answer"]
+
+
+def test_general_conversation_uses_general_prompt_and_recent_context(monkeypatch):
+    monkeypatch.setattr(settings, "ai_provider", "openai")
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(settings, "openai_model", "test-model")
+    observed = {}
+
+    async def capture(prompt, request_id="", **kwargs):
+        observed["prompt"] = prompt
+        observed["system"] = kwargs["system"]
+        return {"answer": "A general answer", "provider": "openai"}
+
+    monkeypatch.setattr(copilot, "_ask_openai", capture)
+    result = asyncio.run(copilot.ask_copilot(
+        "What is recursion?",
+        {"context_mode": "general"},
+        conversation_history=[{"role": "user", "content": "I am learning Python."}],
+    ))
+
+    prompt = json.loads(observed["prompt"])
+    assert result["answer"] == "A general answer"
+    assert observed["system"] == copilot.GENERAL_SYSTEM
+    assert prompt["context_mode"] == "general"
+    assert prompt["computed_dataset_facts"] is None
+    assert prompt["recent_conversation"] == [
+        {"role": "user", "content": "I am learning Python."},
+    ]
 
 
 def test_local_fallback_uses_financial_semantics_and_hides_ambiguous_raw_columns():

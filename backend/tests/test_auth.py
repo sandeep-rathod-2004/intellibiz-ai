@@ -907,6 +907,75 @@ def test_copilot_persists_failed_user_message_and_retries_without_duplication(
     assert [item["role"] for item in after_retry.json()["items"]] == ["user", "assistant"]
 
 
+def test_general_copilot_conversations_are_independent_persisted_and_contextual(
+    auth_client,
+    monkeypatch,
+):
+    client, _ = auth_client
+    register(client, "general-chat@example.com")
+    token = login(client, "general-chat@example.com").json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+    first = client.post(
+        "/api/v1/copilot/conversations",
+        json={"context_mode": "general", "dataset_id": None},
+        headers=headers,
+    )
+    second = client.post(
+        "/api/v1/copilot/conversations",
+        json={"context_mode": "general"},
+        headers=headers,
+    )
+    calls = []
+
+    async def general_answer(question, facts, request_id="", conversation_history=None):
+        calls.append((question, facts, conversation_history))
+        return {"answer": "A persisted general answer.", "provider": "test_provider"}
+
+    monkeypatch.setattr(api_routes, "ask_copilot", general_answer)
+    first_id = first.json()["id"]
+    first_user = client.post(
+        f"/api/v1/copilot/conversations/{first_id}/messages",
+        json={"content": "Explain recursion."},
+        headers=headers,
+    ).json()
+    first_answer = client.post(
+        f"/api/v1/copilot/conversations/{first_id}/messages/{first_user['id']}/answer",
+        headers=headers,
+    )
+    followup = client.post(
+        f"/api/v1/copilot/conversations/{first_id}/messages",
+        json={"content": "Can you show a short example?"},
+        headers=headers,
+    ).json()
+    client.post(
+        f"/api/v1/copilot/conversations/{first_id}/messages/{followup['id']}/answer",
+        headers=headers,
+    )
+
+    assert first.status_code == second.status_code == 201
+    assert first_id != second.json()["id"]
+    assert first.json()["context_mode"] == "general"
+    assert first.json()["dataset_available"] is False
+    assert first_answer.status_code == 200
+    assert calls[0][1] == {"context_mode": "general"}
+    assert calls[1][2] == [
+        {"role": "user", "content": "Explain recursion."},
+        {"role": "assistant", "content": "A persisted general answer."},
+    ]
+    restored = client.get(
+        f"/api/v1/copilot/conversations/{first_id}/messages",
+        headers=headers,
+    )
+    assert [message["role"] for message in restored.json()["items"]] == [
+        "user", "assistant", "user", "assistant",
+    ]
+    assert client.post(
+        "/api/v1/copilot/conversations",
+        json={"context_mode": "dataset"},
+        headers=headers,
+    ).status_code == 422
+
+
 def test_copilot_history_is_user_scoped_and_deletion_preserves_other_domains(auth_client):
     client, test_session = auth_client
     user_a = register(client, "history-a@example.com").json()["user"]["id"]

@@ -840,6 +840,7 @@ interface ChatMessage {
 interface Conversation {
   id: number;
   dataset_id: number | null;
+  context_mode: "general" | "dataset";
   dataset_available: boolean;
   title: string;
   created_at: string;
@@ -921,6 +922,8 @@ export function CopilotPage() {
   const [deleting, setDeleting] = useState(false);
   const [copiedMessageId, setCopiedMessageId] = useState<number | null>(null);
   const [providerStatus, setProviderStatus] = useState<CopilotProviderStatus | null>(null);
+  const [newChatMode, setNewChatMode] = useState<"general" | "dataset">("general");
+  const [creatingConversation, setCreatingConversation] = useState(false);
   const chatBottomRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const requestLockRef = useRef(false);
@@ -1077,14 +1080,17 @@ export function CopilotPage() {
   }, [conversations]);
 
   const startConversation = async () => {
-    if (!selectedDatasetId) {
-      setError("Select a dataset before starting a Copilot conversation.");
+    if (creatingConversation) return;
+    if (newChatMode === "dataset" && !selectedDatasetId) {
+      setError("Select a dataset before starting a dataset-focused conversation.");
       return;
     }
+    setCreatingConversation(true);
     setError("");
     try {
       const response = await api.post<Conversation>("/copilot/conversations", {
-        dataset_id: selectedDatasetId,
+        context_mode: newChatMode,
+        dataset_id: newChatMode === "dataset" ? selectedDatasetId : null,
       });
       setHistorySearch("");
       setSearchTerm("");
@@ -1102,6 +1108,8 @@ export function CopilotPage() {
       setSelectedConversationId(response.data.id);
     } catch (requestError) {
       setError(errorMessage(requestError));
+    } finally {
+      setCreatingConversation(false);
     }
   };
 
@@ -1125,6 +1133,8 @@ export function CopilotPage() {
       void fetchConversations(0);
       const response = await api.post<ChatMessage>(
         `/copilot/conversations/${activeConversation.id}/messages/${appended.data.id}/answer`,
+        undefined,
+        {timeout: 90000},
       );
       setMessages(current => [...current, response.data]);
       setRetryMessageId(null);
@@ -1160,6 +1170,8 @@ export function CopilotPage() {
     try {
       const response = await api.post<ChatMessage>(
         `/copilot/conversations/${activeConversation.id}/messages/${retryMessageId}/answer`,
+        undefined,
+        {timeout: 90000},
       );
       setMessages(current => current.some(message => message.id === response.data.id)
         ? current
@@ -1259,15 +1271,21 @@ export function CopilotPage() {
       <aside className="panel copilot-history" aria-label="Copilot conversations">
         <div className="copilot-history-head">
           <div><span className="eyebrow">YOUR WORKSPACE</span><h3>Conversations</h3></div>
-          <button className="icon-btn" onClick={() => void startConversation()} disabled={!selectedDatasetId} aria-label="Start a new conversation" title={selectedDataset ? `New conversation about ${selectedDataset.name}` : "Select a dataset first"}>
-            <Plus size={17} />
-          </button>
         </div>
+        <label className="copilot-new-chat-mode">New chat type
+          <select value={newChatMode} onChange={event => setNewChatMode(event.target.value as "general" | "dataset")}>
+            <option value="general">General assistant</option>
+            <option value="dataset" disabled={!selectedDatasetId}>Selected dataset{selectedDataset ? ` · ${selectedDataset.name}` : ""}</option>
+          </select>
+        </label>
+        <button className="secondary-btn copilot-new-chat" onClick={() => void startConversation()} disabled={creatingConversation || (newChatMode === "dataset" && !selectedDatasetId)}>
+          <Plus size={16} /> {creatingConversation ? "Creating chat…" : "New Chat"}
+        </button>
         <label className="search-control copilot-search">
           <Search size={15} /><span className="sr-only">Search conversations</span>
           <input value={historySearch} onChange={event => setHistorySearch(event.target.value)} placeholder="Search conversations…" />
         </label>
-        {!selectedDatasetId && <p className="copilot-history-hint">Select a dataset to start a new conversation.</p>}
+        {!selectedDatasetId && <p className="copilot-history-hint">General chats are available now. Select a dataset for data analysis.</p>}
         {conversationLoading && !conversations.length && <div className="skeleton copilot-history-skeleton" role="status" />}
         <div className="copilot-history-list">
           {Object.entries(groupedConversations).map(([group, items]) => items.length > 0 && (
@@ -1284,7 +1302,7 @@ export function CopilotPage() {
                     <>
                       <button className="copilot-history-select" onClick={() => setSelectedConversationId(conversation.id)} aria-current={selectedConversationId === conversation.id ? "page" : undefined}>
                         <b>{conversation.title}</b>
-                        <small>{new Date(conversation.updated_at).toLocaleString()}</small>
+                        <small>{conversation.context_mode === "general" ? "General assistant" : `Dataset #${conversation.dataset_id}`} · {new Date(conversation.updated_at).toLocaleString()}</small>
                       </button>
                       <div className="copilot-history-actions">
                         <button className="icon-btn" onClick={() => {setEditingConversationId(conversation.id); setRenameValue(conversation.title);}} aria-label={`Rename ${conversation.title}`} title="Rename"><Pencil size={13} /></button>
@@ -1318,17 +1336,19 @@ export function CopilotPage() {
           <div>
             <span className="eyebrow">INTELLIBIZ INTELLIGENCE</span>
             <h3>{activeConversation?.title ?? "Ask beyond the numbers."}</h3>
-            <p className="subtle">{activeConversation?.dataset_available
-              ? `Conversation context: dataset #${activeConversation.dataset_id}`
-              : activeConversation
-                ? "The linked dataset is unavailable; saved history remains accessible."
-                : "Start a conversation using a selected dataset."}</p>
+            <p className="subtle">{activeConversation?.context_mode === "general"
+              ? "General assistant · no dataset attached"
+              : activeConversation?.dataset_available
+                ? `Conversation context: dataset #${activeConversation.dataset_id}`
+                : activeConversation
+                  ? "The linked dataset is unavailable; saved history remains accessible."
+                  : "Choose a general chat or a selected dataset to begin."}</p>
           </div>
           <span className={`online-label provider-${providerStatus?.status ?? "checking"}`} role="status" title={providerStatus?.message ?? "Checking AI provider status."}>
             <i /> {copilotProviderStatusLabel(providerStatus?.status)}
           </span>
         </div>
-        <p className="copilot-local-label" role="status">Local computed analysis available · no AI credits used</p>
+        <p className="copilot-local-label" role="status">Dataset chats can answer from local computed analysis. General answers require the configured AI provider.</p>
         {providerStatus && providerStatus.status !== "operational" && (
           <p className="copilot-provider-notice" role="status">
             {providerStatus.message}
@@ -1358,17 +1378,24 @@ export function CopilotPage() {
             <div className="chat-welcome">
               <div className="welcome-spark"><Sparkles size={22} /></div>
               <h2>{activeConversation ? "Where should we look?" : "Your intelligence workspace"}</h2>
-              <p>{activeConversation?.dataset_available
-                ? "Questions are answered using computed information from this conversation’s dataset. Source rows are not sent to the provider."
+              <p>{activeConversation?.context_mode === "general"
+                ? "Ask general questions and follow-ups. This chat has no dataset attached."
+                : activeConversation?.dataset_available
+                  ? "Questions are answered using computed information from this conversation’s dataset. Source rows are not sent to the provider."
                 : activeConversation
                   ? "This conversation’s source dataset was deleted. Its conversation history is preserved."
-                  : "Start a conversation to save your questions and AI answers securely to your account."}</p>
-              {activeConversation?.dataset_available && (
+                  : "Start a general conversation or choose a dataset-focused chat."}</p>
+              {activeConversation && activeConversation.context_mode === "general" && (
+                <div className="prompt-grid">{["Explain a technology concept in simple terms.", "Help me plan a small business launch.", "Write a Python function to clean a CSV.", "Teach me a topic step by step."].map(prompt => (
+                  <button key={prompt} onClick={() => setQuestion(prompt)}>{prompt}<span>↗</span></button>
+                ))}</div>
+              )}
+              {activeConversation?.context_mode === "dataset" && activeConversation.dataset_available && (
                 <div className="prompt-grid">{prompts.map(prompt => (
                   <button key={prompt} onClick={() => setQuestion(prompt)}>{prompt}<span>↗</span></button>
                 ))}</div>
               )}
-              {!activeConversation && selectedDatasetId && (
+              {!activeConversation && (
                 <button className="primary-btn" onClick={() => void startConversation()}>Start a conversation</button>
               )}
             </div>
@@ -1394,7 +1421,7 @@ export function CopilotPage() {
           {busy && <div className="chat-message assistant"><div className="chat-bubble typing" role="status"><i /><i /><i /></div></div>}
           <div ref={chatBottomRef} />
         </div>
-        {retryMessageId !== null && activeConversation?.dataset_available && (
+        {retryMessageId !== null && activeConversation && (activeConversation.context_mode === "general" || activeConversation.dataset_available) && (
           <div className="copilot-retry-notice" role="alert">
             <span>{retryAllowed
               ? "Your question is saved. Retry will reuse it without adding a duplicate message."
@@ -1417,26 +1444,26 @@ export function CopilotPage() {
         <form className="chat-compose" onSubmit={sendMessage}>
           <input
             aria-label="Ask the AI Copilot"
-            placeholder="Ask a question about this dataset…"
+            placeholder={activeConversation?.context_mode === "general" ? "Ask anything…" : "Ask a question about this dataset…"}
             value={question}
             onChange={event => setQuestion(event.target.value)}
             maxLength={1200}
-            disabled={busy || messagesLoading || !activeConversation?.dataset_available || retryMessageId !== null}
+            disabled={busy || messagesLoading || !activeConversation || !(activeConversation.context_mode === "general" || activeConversation.dataset_available) || retryMessageId !== null}
           />
-          <button className="send-btn" disabled={busy || messagesLoading || !activeConversation?.dataset_available || retryMessageId !== null || !question.trim()} aria-label="Send question">
+          <button className="send-btn" disabled={busy || messagesLoading || !activeConversation || !(activeConversation.context_mode === "general" || activeConversation.dataset_available) || retryMessageId !== null || !question.trim()} aria-label="Send question">
             <Sparkles size={16} />
           </button>
         </form>
-        <div className="copilot-disclaimer"><ShieldCheck size={13} /> Only computed dataset facts and a bounded recent conversation are sent. Failed questions remain saved.</div>
+        <div className="copilot-disclaimer"><ShieldCheck size={13} /> {activeConversation?.context_mode === "general" ? "General AI answers use the configured provider and recent chat context; no dataset facts are attached." : "Dataset chats use computed facts and bounded recent context; source rows are excluded."} Failed questions remain saved.</div>
       </section>
 
       <aside className="copilot-side panel">
         <span className="eyebrow">CONTEXT WINDOW</span><h3>What is provided</h3>
-        <div className="context-card"><Database size={17} /><div><b>{activeConversation?.dataset_available
+        <div className="context-card"><Database size={17} /><div><b>{activeConversation?.context_mode === "general" ? "General conversation" : activeConversation?.dataset_available
           ? (selectedDataset?.id === activeConversation.dataset_id ? selectedDataset.name : `Dataset #${activeConversation.dataset_id}`)
           : "No available dataset"}</b><small>{activeConversation?.dataset_available ? "Owned dataset; profile only" : "History remains separate"}</small></div>{activeConversation?.dataset_available && <Check size={15} className="mint" />}</div>
-        <div className="context-card"><BarChart3 size={17} /><div><b>Computed summary</b><small>Source rows excluded</small></div><Check size={15} className="mint" /></div>
-        <div className="side-note"><Sparkles size={17} /><b>Evidence first.</b><p>Answers are grounded in the computed profile. Validate important decisions against source records.</p></div>
+        {activeConversation?.context_mode !== "general" && <div className="context-card"><BarChart3 size={17} /><div><b>Computed summary</b><small>Source rows excluded</small></div><Check size={15} className="mint" /></div>}
+        <div className="side-note"><Sparkles size={17} /><b>Evidence first.</b><p>{activeConversation?.context_mode === "general" ? "General answers use the configured AI provider and may need independent verification." : "Dataset answers use the computed profile. Validate important decisions against source records."}</p></div>
       </aside>
 
       {confirmation && (
